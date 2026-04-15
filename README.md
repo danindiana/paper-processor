@@ -19,6 +19,47 @@ no cloud dependency.
 ![rust-ratatui](https://img.shields.io/badge/TUI-ratatui-FF00FF?style=flat-square)
 ![ollama](https://img.shields.io/badge/backend-ollama-00FFFF?style=flat-square)
 
+## How it works
+
+### System architecture
+
+The wizard (or a direct CLI call) drives the Python pipeline; the pipeline
+talks to Ollama over localhost; Ollama auto-schedules layers across both
+GPUs; outputs land in a mirrored dossier tree.
+
+![system architecture](docs/diagrams/01_architecture.png)
+
+### Per-paper processing flow
+
+Each PDF is extracted, chunked with a sliding window (only if it exceeds
+12 pages), condensed via map-reduce, then run through five independent
+prompt stages. Every stage writes its marker to `metadata.json`, so
+partial runs resume exactly where they left off.
+
+![per-paper flow](docs/diagrams/02_per_paper_flow.png)
+
+### Model auto-selection
+
+Page count picks the model tier. The C++ stage always runs on the
+code-specialised model regardless of length. `num_gpu` is intentionally
+left unset so Ollama can split the 30B models across the 3080+3060 pair
+at 32k context without OOMing.
+
+![model routing](docs/diagrams/03_model_routing.png)
+
+### Wizard state machine
+
+Five tabs cycle with `Tab` / `Shift-Tab`. `F5` re-probes the environment.
+`Enter` on a Scan row queues that paper into Config; `L` launches the
+Python subprocess from the Run tab; `X` kills it.
+
+![wizard tabs](docs/diagrams/04_wizard_tabs.png)
+
+> All four diagrams are in [`docs/diagrams/`](docs/diagrams/) as both `.dot`
+> sources and rendered `.svg` / `.png` — regenerate any of them with
+> `dot -Tpng -Gdpi=140 -o foo.png foo.dot`.
+
+
 ## Output per paper
 
 ```
