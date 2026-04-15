@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+"""
+paper_processor.py — OpenClaw / Ollama AI-ML Paper Processing Pipeline
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For each PDF in the target directory, produces:
+  01_summary.md          — Comprehensive paper summary
+  02_symbolic_logic.md   — Core insights in formal symbolic logic
+  03_cpp_examples.md     — C++20/23 implementations of key algorithms
+  diagrams/              — 6+ Graphviz DOT + rendered SVG (neon/black)
+  04_extras.md           — Open questions, connections, critical assessment
+  metadata.json          — Audit trail (model, hash, timestamps, strategy)
+
+Usage:
+  python paper_processor.py                               # all papers, ollama backend
+  python paper_processor.py --backend openclaw            # use OpenClaw agent CLI
+  python paper_processor.py --model deepseek-r1:14b      # force a model
+  python paper_processor.py --paper "attention.pdf"      # single paper
+  python paper_processor.py --list                        # show status table
+  python paper_processor.py --reprocess diagrams         # redo one section
+  python paper_processor.py --workers 2                  # parallel (VRAM permitting)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# ── Third-party imports ────────────────────────────────────────────────────
+try:
+    import fitz  # pymupdf
+except ImportError:
+    sys.exit("❌  pymupdf not installed.\n    Fix: pip install pymupdf --break-system-packages")
+
+try:
+    import requests
+except ImportError:
+    sys.exit("❌  requests not installed.\n    Fix: pip install requests --break-system-packages")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HARDWARE CONTEXT
+# RTX 3080  → 10 240 MiB VRAM   (GPU 0, display attached)
+# RTX 3060  → 12 288 MiB VRAM   (GPU 1)
+# Total     →  ~22 GB  (Ollama auto-spans with CUDA_VISIBLE_DEVICES or its own scheduler)
+# RAM       → 128 GB   (no OOM concern for CPU offload)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Models in approximate VRAM-fit order (dual-GPU first, then single-GPU)
+MODEL_TIERS = {
+    # ── Dual-GPU tier  (~18–20 GB) ──────────────────────────────────────
+    "xl_quality":   "gemma4:31b-it-q4_K_M",        # Best reasoning/quality
+    "xl_reason":    "deepseek-r1:32b",              # Strong chain-of-thought
+    "xl_code":      "qwen3-coder:30b",              # Best for C++ sections
+    # ── Mid tier  (~14–17 GB) ───────────────────────────────────────────
+    "mid_code":     "devstral:24b",                 # Good code, fits dual-GPU
+    "mid_reason":   "deepseek-r1:14b-qwen-distill-q8_0",  # Q8 fidelity at 14B
+    # ── Single-GPU tier  (≤12 GB, fits on 3060) ─────────────────────────
+    "single":       "deepseek-r1:14b",              # Reliable, 9 GB
+    "single_code":  "qwen2.5-coder:14b",            # Code tasks, 9 GB
+    # ── Fast fallback  (≤6 GB) ──────────────────────────────────────────
+    "fast":         "deepseek-r1:8b",               # 5 GB, very quick
+}
+
+# Page-count → primary model mapping
+TIER_BY_PAGES: List[Tuple[int, str]] = [
+    (8,   "fast"),          # tiny paper / abstract
+    (18,  "single"),        # short paper
+    (35,  "xl_quality"),    # standard conference paper
+    (999, "xl_quality"),    # long paper — chunking handles context overflow
+]
+
+# Separate model for C++ section (code-specialised)
+CODE_MODEL = MODEL_TIERS["xl_code"]
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
+PROMPTS = {
+    "summary": textwrap.dedent("""\
+        Write a comprehensive, well-structured summary of this AI/ML research paper.
+        Your summary must cover ALL of the following:
+          1. Motivation & Problem Statement — what gap does this address?
+          2. Core Methodology — how does the approach work at a high level?
+          3. Key Contributions — what is genuinely novel?
+          4. Experimental Setup & Results — benchmarks, datasets, metrics, numbers
+          5. Limitations & Failure Modes — where does the approach break down?
+          6. Significance — how does this advance the field?
+        Be thorough and precise. Use section headers."""),
+
+    "logic": textwrap.dedent("""\
+        Refactor the paper's core insights using rigorous symbolic logic and formal notation.
+        Structure your response as:
+
+        ## 1. Core Definitions & Notation
+        Define all entities, sets, and functions with formal notation (∈, ⊂, →, ℝⁿ, etc.)
+
+        ## 2. Key Theorems & Propositions
+        State the paper's central claims as formal propositions with ∀, ∃, →, ↔ quantifiers.
+
+        ## 3. Algorithm Formalisation
+        Express each major algorithm using pseudocode with mathematical notation,
+        loop invariants, and complexity bounds (O, Ω, Θ).
+
+        ## 4. Optimality & Convergence Conditions
+        State any convergence theorems, loss landscape properties, or PAC-learning bounds.
+
+        ## 5. Information-Theoretic View
+        Express the core learning objective using entropy H(·), KL divergence, mutual information I(·;·) where applicable."""),
+
+    "cpp": textwrap.dedent("""\
+        Refactor the paper's core insights using well-crafted C++ code examples.
+        Requirements:
+          - Use modern C++20 / C++23 (concepts, ranges, coroutines, std::expected, etc.)
+          - Implement the key algorithms and data structures described in the paper
+          - Each code block must open with a comment block citing the relevant paper section/equation
+          - Provide at least 3 self-contained, compilable examples
+          - Include a main() that exercises each implementation with sample data
+          - Prefer STL containers and algorithms; avoid raw owning pointers
+          - Show template metaprogramming or concept constraints where they model the paper's abstractions
+          - Add inline comments explaining the mapping from math → code"""),
+
+    "extras": textwrap.dedent("""\
+        Provide deep additional analysis beyond what the paper itself claims:
+
+        ## 1. Open Questions
+        What does this paper leave unresolved? What follow-up experiments are obviously needed?
+
+        ## 2. Related Work & Connections
+        How does this relate to other landmark AI/ML papers? What does it supersede?
+        What does it complement? Are there surprising connections to other subfields?
+
+        ## 3. Practical Deployment Considerations
+        Real-world tradeoffs: latency, memory, data requirements, failure modes in production.
+
+        ## 4. Critical Assessment
+        Evaluate the paper's claims critically:
+          - Is the experimental setup fair and reproducible?
+          - Are there cherry-picked baselines?
+          - Do the ablations actually support the claimed conclusions?
+
+        ## 5. Surprising or Underappreciated Insights
+        What does the paper imply but not say explicitly? What would a careful reader notice
+        that a casual reader would miss?
+
+        ## 6. One-Paragraph Pitch & One-Paragraph Critique
+        Steelman the paper in one paragraph. Then write the strongest possible critique in one paragraph."""),
+}
+
+# Diagram generation prompt — model must return delimited DOT blocks
+DIAGRAM_PROMPT = textwrap.dedent("""\
+    Generate exactly 6 Graphviz DOT diagrams that illuminate this AI/ML paper from 6 different angles:
+
+      Diagram 1 — High-Level Architecture / System Overview
+      Diagram 2 — Data Flow & Processing Pipeline
+      Diagram 3 — Core Algorithm as a Flowchart
+      Diagram 4 — Concept Taxonomy / Knowledge Hierarchy
+      Diagram 5 — Training Loop / Optimisation Dynamics
+      Diagram 6 — Comparison vs Prior Art (or Ablation Structure)
+
+    ══ MANDATORY VISUAL STYLE (apply to EVERY diagram) ══
+      graph-level:  bgcolor="black"
+      node default: style=filled, fillcolor="#0a0a0a", fontname="Courier New", fontsize=11
+      Use NEON accent colours for borders, labels, and edges. Pick from:
+        Electric Green  #00FF41    Hot Magenta  #FF00FF    Cyan      #00FFFF
+        Neon Orange     #FF6600    Volt Yellow  #FFFF00    Hot Pink  #FF0055
+        Chartreuse      #7FFF00    Electric Blue #0080FF   Lavender  #DA70FF
+      Edges: penwidth=2.0, use neon colours (vary per diagram)
+      Graph titles: use label= and labelloc=t with a bright fontcolor
+      Mix rankdir=LR and rankdir=TB between diagrams for variety.
+
+    ══ OUTPUT FORMAT — strictly follow this delimiter pattern ══
+    ===DIAGRAM_START: <Descriptive Title for Diagram N>===
+    digraph G {
+      // ... full valid DOT source ...
+    }
+    ===DIAGRAM_END===
+
+    Output ONLY the 6 delimited DOT blocks. No prose before, between, or after.""")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA CLASSES
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class Metadata:
+    paper_name: str
+    pdf_path: str
+    page_count: int
+    chunk_strategy: str
+    model_used: str
+    code_model: str
+    processed_at: str
+    paper_hash: str
+    sections_completed: List[str] = field(default_factory=list)
+
+    def save(self, path: Path):
+        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> Optional["Metadata"]:
+        try:
+            data = json.loads(path.read_text())
+            return cls(**data)
+        except Exception:
+            return None
+
+
+ALL_SECTIONS = {"summary", "logic", "cpp", "diagrams", "extras"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKEND  (Ollama direct API  or  OpenClaw agent CLI)
+# ══════════════════════════════════════════════════════════════════════════════
+class Backend:
+    """
+    Thin abstraction over LLM backends.
+    Ollama  → POST /api/generate  (reliable, full model control)
+    OpenClaw → `openclaw agent --message "..."` subprocess
+               (model selection via OPENCLAW_MODEL env var or pre-configured gateway)
+    """
+
+    def __init__(self, name: str, default_model: str):
+        self.name          = name
+        self.default_model = default_model
+
+    def call(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        ctx_tokens: int = 32768,
+    ) -> str:
+        m = model or self.default_model
+        if self.name == "ollama":
+            return self._call_ollama(prompt, m, ctx_tokens)
+        return self._call_openclaw(prompt, m)
+
+    # ── Ollama ────────────────────────────────────────────────────────────
+    def _call_ollama(self, prompt: str, model: str, ctx: int) -> str:
+        url = f"{OLLAMA_URL}/api/generate"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "num_ctx":        ctx,
+                "temperature":    0.20,
+                "top_p":          0.90,
+                "repeat_penalty": 1.10,
+                # num_gpu intentionally omitted — let Ollama auto-schedule layers.
+                # Forcing num_gpu=999 causes OOM on qwen3-coder:30b (19.5 GiB) across
+                # the 3080(10G)+3060(12G) pair once KV cache at 32k ctx is counted.
+            },
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=1200)
+            r.raise_for_status()
+            return r.json().get("response", "").strip()
+        except requests.exceptions.ConnectionError:
+            sys.exit(
+                f"❌  Cannot reach Ollama at {OLLAMA_URL}\n"
+                "    Is `ollama serve` running?"
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
+
+    # ── OpenClaw ──────────────────────────────────────────────────────────
+    def _call_openclaw(self, prompt: str, model: str) -> str:
+        """
+        Calls:  openclaw agent --message "<prompt>"
+        Model is passed via OPENCLAW_MODEL env var (honoured by some OpenClaw builds).
+        If your build uses a different flag (e.g. --model), adjust cmd below.
+        Run `openclaw agent --help` to check available flags.
+        """
+        env = os.environ.copy()
+        env["OPENCLAW_MODEL"] = model  # no-op if unsupported, harmless otherwise
+
+        cmd = ["openclaw", "agent", "--message", prompt]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=1200,
+                env=env,
+            )
+        except FileNotFoundError:
+            sys.exit("❌  `openclaw` not found in PATH.")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("OpenClaw agent timed out (>20 min)")
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"openclaw agent exited {result.returncode}: {stderr or '(no stderr)'}"
+            )
+
+        output = result.stdout.strip()
+        if not output:
+            raise RuntimeError("openclaw agent returned empty response")
+        return output
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF  UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_pages(pdf_path: Path) -> List[str]:
+    """Return list of text strings, one per page."""
+    doc   = fitz.open(str(pdf_path))
+    pages = [page.get_text("text") for page in doc]
+    doc.close()
+    # Drop blank pages
+    return [p for p in pages if p.strip()]
+
+
+def select_model(page_count: int, user_override: Optional[str]) -> str:
+    if user_override:
+        return user_override
+    for threshold, tier_key in TIER_BY_PAGES:
+        if page_count <= threshold:
+            return MODEL_TIERS[tier_key]
+    return MODEL_TIERS["xl_quality"]
+
+
+def build_chunks(pages: List[str], window: int = 12, overlap: int = 2) -> List[str]:
+    """Sliding-window chunking with overlap to preserve cross-page context."""
+    if len(pages) <= window:
+        return ["\n\n".join(pages)]
+    chunks, i = [], 0
+    while i < len(pages):
+        end = min(i + window, len(pages))
+        chunks.append("\n\n".join(pages[i:end]))
+        if end == len(pages):
+            break
+        i += window - overlap
+    return chunks
+
+
+def map_reduce_chunks(
+    chunks: List[str],
+    backend: Backend,
+    model: str,
+) -> str:
+    """Summarise each chunk, then return joined summaries as condensed context."""
+    if len(chunks) == 1:
+        return chunks[0]
+
+    print(f"      ↳ Map-reduce: {len(chunks)} chunks …")
+    partial: List[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        prompt = (
+            f"You are reading chunk {idx} of {len(chunks)} of an AI/ML research paper. "
+            "Summarise this chunk concisely, preserving all technical details, "
+            "equations, and experimental results:\n\n" + chunk[:18000]
+        )
+        summary = backend.call(prompt, model, ctx_tokens=16384)
+        partial.append(f"### Chunk {idx}/{len(chunks)}\n{summary}")
+        print(f"        chunk {idx}/{len(chunks)} ✓")
+
+    return "\n\n---\n\n".join(partial)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGRAM  PARSING  +  RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+_DELIM_RE = re.compile(
+    r"===DIAGRAM_START:\s*(.+?)===\s*(.*?)===DIAGRAM_END===",
+    re.DOTALL | re.IGNORECASE,
+)
+# Fallback: bare ``` or ```dot fences
+_FENCE_RE = re.compile(
+    r"```(?:dot|graphviz)?\s*\n?((?:digraph|graph)\b.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def parse_diagrams(raw: str) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
+
+    for m in _DELIM_RE.finditer(raw):
+        title = m.group(1).strip()
+        dot   = m.group(2).strip()
+        if dot and ("digraph" in dot.lower() or "graph" in dot.lower()):
+            results.append((title, dot))
+
+    if not results:  # fallback — try fenced blocks
+        for idx, m in enumerate(_FENCE_RE.finditer(raw), 1):
+            results.append((f"diagram_{idx:02d}", m.group(1).strip()))
+
+    return results
+
+
+def ensure_neon_black(dot_src: str) -> str:
+    """
+    Inject bgcolor=black and a default neon node style if the LLM forgot.
+    Non-destructive: skips injection if already present.
+    """
+    if "bgcolor" not in dot_src:
+        dot_src = re.sub(
+            r"((?:di)?graph\s+\w*\s*\{)",
+            r'\1\n  graph [bgcolor="black" fontcolor="#00FF41" fontname="Courier New"];'
+            r'\n  node  [style=filled fillcolor="#0a0a0a" color="#00FF41" fontcolor="#00FF41" fontname="Courier New"];'
+            r'\n  edge  [color="#FF00FF" penwidth=2.0];',
+            dot_src,
+            count=1,
+        )
+    return dot_src
+
+
+def render_dot(dot_src: str, out_svg: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["dot", "-Tsvg", "-o", str(out_svg)],
+            input=dot_src,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return r.returncode == 0
+    except FileNotFoundError:
+        print("      ⚠️  graphviz `dot` not found — SVGs will not be rendered")
+        print("          Fix: sudo apt install graphviz")
+        return False
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPER  PROCESSOR
+# ══════════════════════════════════════════════════════════════════════════════
+class PaperProcessor:
+    def __init__(
+        self,
+        papers_dir: Path,
+        backend: Backend,
+        forced_model: Optional[str] = None,
+        reprocess: Optional[str] = None,
+        verbose: bool = False,
+    ):
+        self.papers_dir   = papers_dir
+        self.out_root     = papers_dir / "_processed"
+        self.backend      = backend
+        self.forced_model = forced_model
+        self.reprocess    = reprocess  # section name or "all"
+        self.verbose      = verbose
+        self.out_root.mkdir(exist_ok=True)
+
+    # ── Utilities ─────────────────────────────────────────────────────────
+    def _paper_dir(self, pdf: Path) -> Path:
+        # Mirror the input tree under _processed/ so subfolder structure is preserved
+        # and slug collisions across subdirs are impossible.
+        try:
+            rel_parent = pdf.parent.relative_to(self.papers_dir)
+        except ValueError:
+            rel_parent = Path("")
+        parent_slug = Path(*[
+            re.sub(r"[^\w\-]", "_", part).lower().strip("_")
+            for part in rel_parent.parts
+        ]) if rel_parent.parts else Path("")
+        stem_slug = re.sub(r"[^\w\-]", "_", pdf.stem)[:64].lower().strip("_")
+        d = self.out_root / parent_slug / stem_slug
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "diagrams").mkdir(exist_ok=True)
+        return d
+
+    def _should_run(self, section: str, completed: List[str]) -> bool:
+        if self.reprocess in (section, "all"):
+            return True
+        return section not in completed
+
+    def _write_md(self, path: Path, heading: str, body: str):
+        path.write_text(f"# {heading}\n\n{body}\n", encoding="utf-8")
+
+    def _tag_prompt(self, task_prompt: str, context: str) -> str:
+        """Wrap paper context in XML tags for cleaner prompt structure."""
+        return f"{task_prompt}\n\n<paper>\n{context}\n</paper>"
+
+    # ── Main entry ────────────────────────────────────────────────────────
+    def process(self, pdf_path: Path) -> None:
+        paper_dir = self._paper_dir(pdf_path)
+        meta_path = paper_dir / "metadata.json"
+        meta      = Metadata.load(meta_path)
+
+        # Skip if fully complete and no reprocess requested
+        if (
+            meta is not None
+            and ALL_SECTIONS.issubset(set(meta.sections_completed))
+            and self.reprocess is None
+        ):
+            print(f"  ⏭   {pdf_path.name}  (all sections complete)")
+            return
+
+        print(f"\n{'─'*64}")
+        print(f"  📄  {pdf_path.name}")
+
+        # ── Extract & chunk ───────────────────────────────────────────────
+        pages      = extract_pages(pdf_path)
+        page_count = len(pages)
+        model      = select_model(page_count, self.forced_model)
+        code_model = self.forced_model or CODE_MODEL
+
+        chunks     = build_chunks(pages)
+        strategy   = (
+            f"single-pass ({page_count} pages)"
+            if len(chunks) == 1
+            else f"sliding-window ({len(chunks)} chunks, {page_count} pages)"
+        )
+
+        print(f"     pages={page_count}  chunks={len(chunks)}")
+        print(f"     model={model}")
+        print(f"     code_model={code_model}")
+        print(f"     strategy={strategy}")
+
+        # Condense multi-chunk papers to a manageable context string
+        context = map_reduce_chunks(chunks, self.backend, model)
+
+        # Cap to ~90k chars (~22k tokens) — safe for 32k-ctx models
+        capped = context[:90_000]
+
+        completed: List[str] = list(meta.sections_completed) if meta else []
+
+        # ── 1. Summary ────────────────────────────────────────────────────
+        if self._should_run("summary", completed):
+            print("     📝  Summary …")
+            out = self.backend.call(
+                self._tag_prompt(PROMPTS["summary"], capped), model
+            )
+            self._write_md(paper_dir / "01_summary.md", "Summary", out)
+            if "summary" not in completed:
+                completed.append("summary")
+            print("         ✓")
+
+        # ── 2. Symbolic Logic ─────────────────────────────────────────────
+        if self._should_run("logic", completed):
+            print("     🔣  Symbolic logic …")
+            out = self.backend.call(
+                self._tag_prompt(PROMPTS["logic"], capped), model
+            )
+            self._write_md(
+                paper_dir / "02_symbolic_logic.md",
+                "Symbolic Logic Formulation",
+                out,
+            )
+            if "logic" not in completed:
+                completed.append("logic")
+            print("         ✓")
+
+        # ── 3. C++ Examples ───────────────────────────────────────────────
+        if self._should_run("cpp", completed):
+            print(f"     💻  C++ examples  (model: {code_model}) …")
+            out = self.backend.call(
+                self._tag_prompt(PROMPTS["cpp"], capped), code_model
+            )
+            self._write_md(
+                paper_dir / "03_cpp_examples.md",
+                "C++ Implementation Examples",
+                out,
+            )
+            if "cpp" not in completed:
+                completed.append("cpp")
+            print("         ✓")
+
+        # ── 4. Graphviz Diagrams ──────────────────────────────────────────
+        if self._should_run("diagrams", completed):
+            print("     📊  Graphviz diagrams …")
+            raw = self.backend.call(
+                self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
+                model,
+                ctx_tokens=32768,
+            )
+            diagrams = parse_diagrams(raw)
+
+            if not diagrams:
+                # Save raw output so user can inspect / manually extract DOT
+                raw_out = paper_dir / "diagrams" / "_raw_llm_output.txt"
+                raw_out.write_text(raw, encoding="utf-8")
+                print(
+                    f"     ⚠️   No diagrams parsed from LLM output.\n"
+                    f"          Raw output saved → {raw_out}\n"
+                    f"          Tip: re-run with --reprocess diagrams after inspecting output."
+                )
+            else:
+                for idx, (title, dot_src) in enumerate(diagrams, 1):
+                    dot_src  = ensure_neon_black(dot_src)
+                    safe     = re.sub(r"[^\w\-]", "_", title)[:40].lower().strip("_")
+                    dot_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.dot"
+                    svg_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.svg"
+                    dot_path.write_text(dot_src, encoding="utf-8")
+                    ok     = render_dot(dot_src, svg_path)
+                    status = "✓" if ok else "✗ (dot saved, SVG render failed)"
+                    print(f"       {idx}. {title:<45} {status}")
+
+            if "diagrams" not in completed:
+                completed.append("diagrams")
+
+        # ── 5. Extras ─────────────────────────────────────────────────────
+        if self._should_run("extras", completed):
+            print("     💡  Extras / critical analysis …")
+            out = self.backend.call(
+                self._tag_prompt(PROMPTS["extras"], capped), model
+            )
+            self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
+            if "extras" not in completed:
+                completed.append("extras")
+            print("         ✓")
+
+        # ── Write / update metadata ────────────────────────────────────────
+        paper_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
+        Metadata(
+            paper_name        = pdf_path.name,
+            pdf_path          = str(pdf_path),
+            page_count        = page_count,
+            chunk_strategy    = strategy,
+            model_used        = model,
+            code_model        = code_model,
+            processed_at      = time.strftime("%Y-%m-%dT%H:%M:%S"),
+            paper_hash        = paper_hash,
+            sections_completed= completed,
+        ).save(meta_path)
+
+        print(f"     ✅  Output → {paper_dir}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
+def list_status(papers_dir: Path):
+    processed_dir = papers_dir / "_processed"
+    pdfs = sorted(p for p in papers_dir.rglob("*.pdf") if "_processed" not in p.parts)
+    if not pdfs:
+        print(f"  No PDFs found in {papers_dir}")
+        return
+
+    print(f"\n  {'Paper':<60}  {'Status'}")
+    print(f"  {'─'*60}  {'─'*30}")
+    for pdf in pdfs:
+        try:
+            rel_parent = pdf.parent.relative_to(papers_dir)
+        except ValueError:
+            rel_parent = Path("")
+        parent_slug = Path(*[
+            re.sub(r"[^\w\-]", "_", part).lower().strip("_")
+            for part in rel_parent.parts
+        ]) if rel_parent.parts else Path("")
+        stem_slug = re.sub(r"[^\w\-]", "_", pdf.stem)[:64].lower().strip("_")
+        meta_path = processed_dir / parent_slug / stem_slug / "metadata.json"
+        meta      = Metadata.load(meta_path) if meta_path.exists() else None
+
+        if meta is None:
+            status = "⬜  not started"
+        elif ALL_SECTIONS.issubset(set(meta.sections_completed)):
+            status = f"✅  complete  [{meta.model_used}]"
+        else:
+            missing = ALL_SECTIONS - set(meta.sections_completed)
+            status  = f"⚠️   partial — missing: {', '.join(sorted(missing))}"
+
+        rel = pdf.relative_to(papers_dir).as_posix()
+        name = rel[:58] + "…" if len(rel) > 58 else rel
+        print(f"  {name:<60}  {status}")
+    print()
+
+
+def health_check_ollama():
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
+        print(f"  🟢  Ollama reachable at {OLLAMA_URL}")
+        print(f"       {len(models)} models available")
+        return True
+    except Exception as exc:
+        print(f"  ❌  Cannot reach Ollama at {OLLAMA_URL}: {exc}")
+        return False
+
+
+def health_check_openclaw():
+    try:
+        r = subprocess.run(
+            ["openclaw", "health"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            print("  🟢  OpenClaw gateway healthy")
+            return True
+        print(f"  ⚠️   openclaw health returned {r.returncode}: {r.stderr.strip()}")
+        return False
+    except FileNotFoundError:
+        print("  ❌  `openclaw` not found in PATH")
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="paper_processor",
+        description="🦞  OpenClaw / Ollama  AI-ML Paper Processing Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Output tree per paper:
+              _processed/<slug>/
+                metadata.json
+                01_summary.md
+                02_symbolic_logic.md
+                03_cpp_examples.md
+                04_extras.md
+                diagrams/
+                  01_<title>.dot
+                  01_<title>.svg
+                  …  (6+ diagrams)
+
+            Model auto-selection by page count:
+              ≤ 8  pages  →  deepseek-r1:8b      (~5 GB)
+              ≤ 18 pages  →  deepseek-r1:14b     (~9 GB)
+              > 18 pages  →  gemma4:31b-q4_K_M   (~18 GB, dual-GPU)
+              C++ section →  qwen3-coder:30b      (~17 GB, dual-GPU)
+        """),
+    )
+    ap.add_argument(
+        "papers_dir", nargs="?",
+        default="/home/jeb/Documents/AI-ML_Papers",
+        help="Directory containing PDF papers (default: ~/Documents/AI-ML_Papers)",
+    )
+    ap.add_argument(
+        "--backend", choices=["ollama", "openclaw"], default="ollama",
+        help="LLM backend: 'ollama' (direct API) or 'openclaw' (agent CLI) [default: ollama]",
+    )
+    ap.add_argument(
+        "--model", default=None, metavar="MODEL",
+        help="Force a specific model for all sections (overrides auto-selection)",
+    )
+    ap.add_argument(
+        "--paper", default=None, metavar="FILENAME",
+        help="Process a single paper by filename (e.g. 'attention.pdf')",
+    )
+    ap.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help="Parallel paper workers — keep at 1 unless papers are small (VRAM limit)",
+    )
+    ap.add_argument(
+        "--list", action="store_true",
+        help="Show processing status for all papers and exit",
+    )
+    ap.add_argument(
+        "--reprocess", default=None,
+        metavar="SECTION",
+        help="Re-run a specific section for all papers: summary|logic|cpp|diagrams|extras|all",
+    )
+    ap.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Extra debug output",
+    )
+    args = ap.parse_args()
+
+    papers_dir = Path(args.papers_dir)
+    if not papers_dir.exists():
+        sys.exit(f"❌  Directory not found: {papers_dir}")
+
+    # ── List mode ──────────────────────────────────────────────────────────
+    if args.list:
+        list_status(papers_dir)
+        return
+
+    # ── Health check ───────────────────────────────────────────────────────
+    print(f"\n  🦞  OpenClaw Paper Processor")
+    print(f"  {'─'*40}")
+    ok = health_check_ollama() if args.backend == "ollama" else health_check_openclaw()
+    if not ok:
+        sys.exit(1)
+
+    default_model = args.model or MODEL_TIERS["xl_quality"]
+    backend       = Backend(args.backend, default_model)
+
+    print(f"  Backend   : {args.backend}")
+    print(f"  Default   : {default_model}")
+    if args.reprocess:
+        print(f"  Reprocess : {args.reprocess}")
+
+    # ── Build file list ────────────────────────────────────────────────────
+    if args.paper:
+        target = papers_dir / args.paper
+        if not target.exists():
+            # Fallback: search recursively by basename
+            matches = [p for p in papers_dir.rglob(args.paper) if p.is_file()]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                sys.exit(
+                    f"❌  Ambiguous --paper '{args.paper}' — {len(matches)} matches:\n    "
+                    + "\n    ".join(str(m.relative_to(papers_dir)) for m in matches[:10])
+                )
+            else:
+                sys.exit(f"❌  File not found: {target}")
+        pdfs = [target]
+    else:
+        pdfs = sorted(
+            p for p in papers_dir.rglob("*.pdf") if "_processed" not in p.parts
+        )
+        if not pdfs:
+            sys.exit(f"❌  No PDF files found in {papers_dir}")
+
+    print(f"  Papers    : {len(pdfs)}")
+    print(f"  Output    : {papers_dir / '_processed'}")
+    print()
+
+    processor = PaperProcessor(
+        papers_dir   = papers_dir,
+        backend      = backend,
+        forced_model = args.model,
+        reprocess    = args.reprocess,
+        verbose      = args.verbose,
+    )
+
+    # ── Process ────────────────────────────────────────────────────────────
+    errors: List[str] = []
+
+    if args.workers > 1:
+        print(f"  ⚡ Parallel mode: {args.workers} workers")
+        print(f"  ⚠️   Ensure models fit in VRAM when running concurrently!\n")
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(processor.process, pdf): pdf for pdf in pdfs}
+            for fut in as_completed(futures):
+                pdf = futures[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    msg = f"{pdf.name}: {exc}"
+                    errors.append(msg)
+                    print(f"  ❌  {msg}")
+    else:
+        for pdf in pdfs:
+            try:
+                processor.process(pdf)
+            except Exception as exc:
+                msg = f"{pdf.name}: {exc}"
+                errors.append(msg)
+                print(f"  ❌  {msg}")
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    print(f"\n{'═'*64}")
+    succeeded = len(pdfs) - len(errors)
+    print(f"  ✅  {succeeded}/{len(pdfs)} papers processed successfully")
+    if errors:
+        print(f"  ❌  {len(errors)} error(s):")
+        for e in errors:
+            print(f"       • {e}")
+    print(f"{'═'*64}\n")
+
+
+if __name__ == "__main__":
+    main()
