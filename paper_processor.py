@@ -25,11 +25,13 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -44,6 +46,21 @@ try:
     import requests
 except ImportError:
     sys.exit("❌  requests not installed.\n    Fix: pip install requests --break-system-packages")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRACEFUL SHUTDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+_shutdown = threading.Event()
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum, frame):
+        if not _shutdown.is_set():
+            print("\n\n  ⚡  Shutdown requested — finishing current section then stopping …")
+            _shutdown.set()
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -487,6 +504,29 @@ class PaperProcessor:
         """Wrap paper context in XML tags for cleaner prompt structure."""
         return f"{task_prompt}\n\n<paper>\n{context}\n</paper>"
 
+    def _save_meta(
+        self,
+        meta_path: Path,
+        pdf_path: Path,
+        page_count: int,
+        strategy: str,
+        model: str,
+        code_model: str,
+        paper_hash: str,
+        completed: List[str],
+    ) -> None:
+        Metadata(
+            paper_name        = pdf_path.name,
+            pdf_path          = str(pdf_path),
+            page_count        = page_count,
+            chunk_strategy    = strategy,
+            model_used        = model,
+            code_model        = code_model,
+            processed_at      = time.strftime("%Y-%m-%dT%H:%M:%S"),
+            paper_hash        = paper_hash,
+            sections_completed= completed,
+        ).save(meta_path)
+
     # ── Main entry ────────────────────────────────────────────────────────
     def process(self, pdf_path: Path) -> None:
         paper_dir = self._paper_dir(pdf_path)
@@ -523,6 +563,9 @@ class PaperProcessor:
         print(f"     code_model={code_model}")
         print(f"     strategy={strategy}")
 
+        # Compute once — used for checkpoints throughout
+        paper_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
+
         # Condense multi-chunk papers to a manageable context string
         context = map_reduce_chunks(chunks, self.backend, model)
 
@@ -531,8 +574,21 @@ class PaperProcessor:
 
         completed: List[str] = list(meta.sections_completed) if meta else []
 
+        def _checkpoint():
+            self._save_meta(meta_path, pdf_path, page_count, strategy,
+                            model, code_model, paper_hash, completed)
+
+        def _shutting_down() -> bool:
+            if _shutdown.is_set():
+                _checkpoint()
+                print(f"     ⚡  Stopped — {len(completed)} section(s) saved")
+                return True
+            return False
+
         # ── 1. Summary ────────────────────────────────────────────────────
         if self._should_run("summary", completed):
+            if _shutting_down():
+                return
             print("     📝  Summary …")
             out = self.backend.call(
                 self._tag_prompt(PROMPTS["summary"], capped), model
@@ -540,10 +596,13 @@ class PaperProcessor:
             self._write_md(paper_dir / "01_summary.md", "Summary", out)
             if "summary" not in completed:
                 completed.append("summary")
+            _checkpoint()
             print("         ✓")
 
         # ── 2. Symbolic Logic ─────────────────────────────────────────────
         if self._should_run("logic", completed):
+            if _shutting_down():
+                return
             print("     🔣  Symbolic logic …")
             out = self.backend.call(
                 self._tag_prompt(PROMPTS["logic"], capped), model
@@ -555,10 +614,13 @@ class PaperProcessor:
             )
             if "logic" not in completed:
                 completed.append("logic")
+            _checkpoint()
             print("         ✓")
 
         # ── 3. C++ Examples ───────────────────────────────────────────────
         if self._should_run("cpp", completed):
+            if _shutting_down():
+                return
             print(f"     💻  C++ examples  (model: {code_model}) …")
             out = self.backend.call(
                 self._tag_prompt(PROMPTS["cpp"], capped), code_model
@@ -570,10 +632,13 @@ class PaperProcessor:
             )
             if "cpp" not in completed:
                 completed.append("cpp")
+            _checkpoint()
             print("         ✓")
 
         # ── 4. Graphviz Diagrams ──────────────────────────────────────────
         if self._should_run("diagrams", completed):
+            if _shutting_down():
+                return
             print("     📊  Graphviz diagrams …")
             raw = self.backend.call(
                 self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
@@ -604,9 +669,12 @@ class PaperProcessor:
 
             if "diagrams" not in completed:
                 completed.append("diagrams")
+            _checkpoint()
 
         # ── 5. Extras ─────────────────────────────────────────────────────
         if self._should_run("extras", completed):
+            if _shutting_down():
+                return
             print("     💡  Extras / critical analysis …")
             out = self.backend.call(
                 self._tag_prompt(PROMPTS["extras"], capped), model
@@ -614,22 +682,11 @@ class PaperProcessor:
             self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
             if "extras" not in completed:
                 completed.append("extras")
+            _checkpoint()
             print("         ✓")
 
         # ── Write / update metadata ────────────────────────────────────────
-        paper_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
-        Metadata(
-            paper_name        = pdf_path.name,
-            pdf_path          = str(pdf_path),
-            page_count        = page_count,
-            chunk_strategy    = strategy,
-            model_used        = model,
-            code_model        = code_model,
-            processed_at      = time.strftime("%Y-%m-%dT%H:%M:%S"),
-            paper_hash        = paper_hash,
-            sections_completed= completed,
-        ).save(meta_path)
-
+        _checkpoint()
         print(f"     ✅  Output → {paper_dir}")
 
 
@@ -771,6 +828,8 @@ def main():
         list_status(papers_dir)
         return
 
+    _install_signal_handlers()
+
     # ── Health check ───────────────────────────────────────────────────────
     print(f"\n  🦞  OpenClaw Paper Processor")
     print(f"  {'─'*40}")
@@ -829,16 +888,28 @@ def main():
         print(f"  ⚠️   Ensure models fit in VRAM when running concurrently!\n")
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {pool.submit(processor.process, pdf): pdf for pdf in pdfs}
-            for fut in as_completed(futures):
-                pdf = futures[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    msg = f"{pdf.name}: {exc}"
-                    errors.append(msg)
-                    print(f"  ❌  {msg}")
+            remaining = set(futures)
+            while remaining:
+                done, remaining = wait(remaining, timeout=2.0,
+                                       return_when=FIRST_COMPLETED)
+                for fut in done:
+                    pdf = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        msg = f"{pdf.name}: {exc}"
+                        errors.append(msg)
+                        print(f"  ❌  {msg}")
+                if _shutdown.is_set():
+                    print(f"  ⚡  Cancelling {len(remaining)} pending paper(s) …")
+                    for f in remaining:
+                        f.cancel()
+                    break
     else:
         for pdf in pdfs:
+            if _shutdown.is_set():
+                print(f"  ⚡  Shutdown — skipping remaining {len(pdfs) - pdfs.index(pdf)} paper(s)")
+                break
             try:
                 processor.process(pdf)
             except Exception as exc:
