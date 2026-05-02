@@ -116,6 +116,9 @@ python paper_processor.py ~/my_papers --reprocess diagrams
 
 # Status of the whole corpus, no LLM calls
 python paper_processor.py ~/my_papers --list
+
+# Evict any loaded model from VRAM before starting (restart service if stuck)
+python paper_processor.py ~/my_papers --override
 ```
 
 ## TUI wizard
@@ -145,6 +148,7 @@ python paper_processor.py [papers_dir]
     --reprocess SECTION           summary|logic|cpp|diagrams|extras|all
     --workers N                   parallel papers (⚠ VRAM)
     --list                        show status table, exit
+    --override                    evict loaded Ollama models; restart service if stuck
 ```
 
 ## Design notes
@@ -160,6 +164,11 @@ python paper_processor.py [papers_dir]
 - **Diagram aesthetic.** The LLM is explicitly instructed to emit neon
   accent colours on a black background; a post-processor injects
   `bgcolor=black` + default neon styles if the model forgets.
+- **`--override` GPU provisioner.** Checks `/api/ps` before the first
+  paper and evicts every loaded model via `keep_alive=0`. If any model
+  is still resident after 20 s it restarts the `ollama` systemd service
+  and waits up to 45 s for it to come back. Safe to combine with any
+  other flag; no-op when the backend is not Ollama.
 - **`num_gpu` intentionally unset.** Hard-forcing all layers on GPU causes
   OOM on 30B models at `num_ctx=32768` across a ≤22 GB VRAM pool; letting
   Ollama auto-schedule fixes it.

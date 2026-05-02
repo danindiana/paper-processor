@@ -18,6 +18,7 @@ Usage:
   python paper_processor.py --list                        # show status table
   python paper_processor.py --reprocess diagrams         # redo one section
   python paper_processor.py --workers 2                  # parallel (VRAM permitting)
+  python paper_processor.py --override                   # evict loaded models, restart if stuck
 """
 
 import argparse
@@ -99,6 +100,118 @@ TIER_BY_PAGES: List[Tuple[int, str]] = [
 CODE_MODEL = MODEL_TIERS["xl_code"]
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OLLAMA GPU PROVISIONER  (--override mode)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ollama_get_loaded() -> List[str]:
+    """Return names of models currently resident in VRAM via /api/ps."""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def _ollama_evict(model: str) -> bool:
+    """Ask Ollama to unload a model immediately (keep_alive=0)."""
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=20,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _ollama_wait_clean(timeout: int = 30, interval: float = 2.0) -> bool:
+    """Poll /api/ps until no models are loaded or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _ollama_get_loaded():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _ollama_restart_service() -> bool:
+    """Restart the ollama systemd service and wait for it to come back online."""
+    print("  🔄  Restarting ollama service …")
+    try:
+        r = subprocess.run(
+            ["sudo", "systemctl", "restart", "ollama"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            print(f"  ⚠️   systemctl restart failed: {r.stderr.strip()}")
+            return False
+    except Exception as exc:
+        print(f"  ❌  Could not restart ollama: {exc}")
+        return False
+
+    print("  ⏳  Waiting for Ollama to come back up …", end="", flush=True)
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+            if r.status_code == 200:
+                print(" up!")
+                return True
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+    print(" timed out")
+    return False
+
+
+def provision_ollama(verbose: bool = False) -> bool:
+    """
+    Aggressively free GPU VRAM before processing starts.
+
+    Escalation ladder:
+      1. Evict every loaded model via keep_alive=0 generate requests.
+      2. If any model is still loaded after 20 s, restart the ollama service.
+      3. Verify clean state; warn but do not abort if it cannot be confirmed.
+
+    Returns True when Ollama is up and VRAM appears free (or after best effort).
+    """
+    print("\n  🎯  Override: provisioning Ollama for exclusive GPU use …")
+
+    loaded = _ollama_get_loaded()
+    if not loaded:
+        print("  ✓   No models currently loaded — GPU is free")
+        return True
+
+    # Level 1: graceful eviction via keep_alive=0
+    print(f"  ⚡  Evicting {len(loaded)} loaded model(s): {', '.join(loaded)}")
+    for model in loaded:
+        print(f"       → {model} …", end="", flush=True)
+        ok = _ollama_evict(model)
+        print(" ✓" if ok else " ✗")
+
+    if _ollama_wait_clean(timeout=20):
+        print("  ✅  All models evicted — GPU is free\n")
+        return True
+
+    # Level 2: force a service restart
+    remaining = _ollama_get_loaded()
+    print(f"  ⚠️   {len(remaining)} model(s) still loaded — escalating to service restart")
+    if not _ollama_restart_service():
+        print("  ⚠️   Service restart failed — proceeding anyway\n")
+        return False
+
+    if _ollama_wait_clean(timeout=15):
+        print("  ✅  Ollama restarted clean\n")
+        return True
+
+    print("  ⚠️   Could not confirm clean VRAM — proceeding anyway\n")
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -814,6 +927,14 @@ def main():
         help="Re-run a specific section for all papers: summary|logic|cpp|diagrams|extras|all",
     )
     ap.add_argument(
+        "--override", action="store_true",
+        help=(
+            "Aggressively provision GPU before processing: evict all loaded "
+            "Ollama models (keep_alive=0), and restart the ollama service if "
+            "any model is still resident after eviction."
+        ),
+    )
+    ap.add_argument(
         "--verbose", "-v", action="store_true",
         help="Extra debug output",
     )
@@ -836,6 +957,9 @@ def main():
     ok = health_check_ollama() if args.backend == "ollama" else health_check_openclaw()
     if not ok:
         sys.exit(1)
+
+    if args.override and args.backend == "ollama":
+        provision_ollama(verbose=args.verbose)
 
     default_model = args.model or MODEL_TIERS["xl_quality"]
     backend       = Backend(args.backend, default_model)
