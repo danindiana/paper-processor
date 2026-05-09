@@ -442,15 +442,18 @@ class Backend:
     # ── OpenClaw ──────────────────────────────────────────────────────────
     def _call_openclaw(self, prompt: str, model: str) -> str:
         """
-        Calls:  openclaw agent --message "<prompt>"
-        Model is passed via OPENCLAW_MODEL env var (honoured by some OpenClaw builds).
-        If your build uses a different flag (e.g. --model), adjust cmd below.
-        Run `openclaw agent --help` to check available flags.
+        Calls:  openclaw agent --agent main --message "<prompt>"
+        Routes via the gateway and uses the agent's configured default model
+        (set in ~/.openclaw/openclaw.json). OPENCLAW_MODEL is exported for
+        builds that honour it, but the gateway path ignores per-call overrides
+        unless the caller is authorised — so per-page-count routing is a
+        no-op here. To restore per-call model selection, switch to
+        `openclaw agent --local --agent main --model <model> --message <p>`.
         """
         env = os.environ.copy()
-        env["OPENCLAW_MODEL"] = model  # no-op if unsupported, harmless otherwise
+        env["OPENCLAW_MODEL"] = model  # no-op against the gateway path
 
-        cmd = ["openclaw", "agent", "--message", prompt]
+        cmd = ["openclaw", "agent", "--agent", "main", "--message", prompt]
 
         try:
             # Using Popen + poll for interruptibility
