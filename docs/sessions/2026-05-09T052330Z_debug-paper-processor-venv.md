@@ -221,3 +221,61 @@ Output side-effects in `_processed/`:
   `deepseek-r1:8b` (5 GB), `deepseek-r1:14b` (9 GB), or `gemma4:31b-it-q4_K_M`
   (~18 GB). The `qwen3.5` family currently on this host is not suitable for
   the existing prompt templates.
+
+---
+
+## Pickup status (paused 2026-05-09T05:35Z)
+
+**Committed locally, not pushed.** `git log origin/main..HEAD` =
+
+```
+6f63141 Stream Ollama calls, gate on local models, venv shebang   (this session)
+cd85cdb Add session doc: install mc + Dracula skin on morlok       (prior)
+16550f2 Add session docs: Python 3.13 venv + zsh install on morlok (prior)
+```
+
+**Why no push yet:** this host (`morlok` user, WORLOCK drive mount) has no
+GitHub credentials configured.
+
+- Remote is HTTPS: `https://github.com/danindiana/paper-processor.git`
+- No `credential.helper` set, no `~/.ssh/` private key, ssh-agent empty,
+  `gh` CLI not installed.
+- CLAUDE.md's "stored token / `gh` available" note refers to the **worlock**
+  host (jeb user), not this morlok session.
+
+**To finish later, pick one:**
+
+```bash
+# A — one-shot HTTPS push with a personal access token (no persistence):
+git push https://danindiana:<token>@github.com/danindiana/paper-processor.git main
+
+# B — switch remote to SSH (need to generate a key here and add the public
+#     half to https://github.com/settings/keys first):
+ssh-keygen -t ed25519 -C "morlok@worlock-mount"        # accept default path
+cat ~/.ssh/id_ed25519.pub                              # paste into GitHub UI
+git remote set-url origin git@github.com:danindiana/paper-processor.git
+git push origin main
+
+# C — push from worlock (jeb account, where credentials already work):
+ssh worlock "cd /path/to/paper_processor && git pull && git push"
+```
+
+**Cleanup leftovers (optional):** these `_processed/` dirs are debug
+artifacts outside the repo and can be removed safely.
+
+```bash
+rm -rf /run/media/morlok/WORLOCK/home/jeb/Documents/AI-ML_Papers/_processed/huang_cv_failure
+rm -rf /run/media/morlok/WORLOCK/home/jeb/Documents/AI-ML_Papers/_processed/ferguson-abstract
+```
+
+**Open follow-ups (none blocking):**
+
+1. Pull a `MODEL_TIERS`-compatible model (`deepseek-r1:8b` smallest) and
+   re-run an end-to-end on `ferguson-abstract.pdf` to fully exercise all 5
+   sections + diagram rendering.
+2. Investigate the qwen3.5 empty-C++-section anomaly (likely model emits
+   `thinking` field instead of `response`; the streaming loop in
+   `Backend._call_ollama` only accumulates `response`). Out of scope unless
+   we want qwen3.5 support.
+3. Add an empty-section guard so the script doesn't checkpoint a section as
+   complete when the LLM returned `""`.
