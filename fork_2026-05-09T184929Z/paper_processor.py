@@ -535,21 +535,40 @@ def map_reduce_chunks(
     if len(chunks) == 1:
         return chunks[0]
 
-    print(f"      ↳ Map-reduce: {len(chunks)} chunks …")
-    partial: List[str] = []
-    for idx, chunk in enumerate(chunks, 1):
+    num_parallel = int(os.environ.get("OLLAMA_NUM_PARALLEL", "2"))
+    print(f"      ↳ Map-reduce: {len(chunks)} chunks (parallel={num_parallel}) …")
+
+    def _process_chunk(idx_chunk: Tuple[int, str]) -> Tuple[int, str]:
+        idx, chunk = idx_chunk
         if _shutdown.is_set():
-            raise _ShutdownRequested()
+            return idx, ""
         prompt = (
             f"You are reading chunk {idx} of {len(chunks)} of an AI/ML research paper. "
             "Summarise this chunk concisely, preserving all technical details, "
             "equations, and experimental results:\n\n" + chunk[:18000]
         )
         summary = backend.call(prompt, model, ctx_tokens=16384)
-        partial.append(f"### Chunk {idx}/{len(chunks)}\n{summary}")
         print(f"        chunk {idx}/{len(chunks)} ✓")
+        return idx, f"### Chunk {idx}/{len(chunks)}\n{summary}"
 
-    return "\n\n---\n\n".join(partial)
+    # Process chunks in parallel using ThreadPoolExecutor
+    indexed_chunks = list(enumerate(chunks, 1))
+    results: List[Tuple[int, str]] = []
+
+    with ThreadPoolExecutor(max_workers=num_parallel) as executor:
+        futures = {executor.submit(_process_chunk, ic): ic for ic in indexed_chunks}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"        chunk failed: {exc}")
+
+    if _shutdown.is_set():
+        raise _ShutdownRequested()
+
+    # Ensure results are in the original order
+    results.sort(key=lambda x: x[0])
+    return "\n\n---\n\n".join(res for idx, res in results if res)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
