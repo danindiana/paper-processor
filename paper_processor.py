@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ./.venv/bin/python
 """
 paper_processor.py — OpenClaw / Ollama AI-ML Paper Processing Pipeline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -57,11 +57,18 @@ _shutdown = threading.Event()
 
 def _install_signal_handlers() -> None:
     def _handler(signum, frame):
-        if not _shutdown.is_set():
-            print("\n\n  ⚡  Shutdown requested — finishing current section then stopping …")
-            _shutdown.set()
+        if _shutdown.is_set():
+            print("\n  🚨  Forced exit requested — stopping immediately!")
+            os._exit(1)
+        print("\n\n  ⚡  Shutdown requested — finishing current section then stopping …")
+        print("      (Press Ctrl+C again to force exit immediately)")
+        _shutdown.set()
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
+
+
+class _ShutdownRequested(Exception):
+    """Raised when _shutdown fires during a blocking LLM call or map-reduce loop."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -382,28 +389,55 @@ class Backend:
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,  # Enable streaming for interruptibility
             "options": {
                 "num_ctx":        ctx,
                 "temperature":    0.20,
                 "top_p":          0.90,
                 "repeat_penalty": 1.10,
-                # num_gpu intentionally omitted — let Ollama auto-schedule layers.
-                # Forcing num_gpu=999 causes OOM on qwen3-coder:30b (19.5 GiB) across
-                # the 3080(10G)+3060(12G) pair once KV cache at 32k ctx is counted.
             },
         }
-        try:
-            r = requests.post(url, json=payload, timeout=1200)
-            r.raise_for_status()
-            return r.json().get("response", "").strip()
-        except requests.exceptions.ConnectionError:
-            sys.exit(
-                f"❌  Cannot reach Ollama at {OLLAMA_URL}\n"
-                "    Is `ollama serve` running?"
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
+        for attempt in range(1, 3):
+            if _shutdown.is_set():
+                return ""
+
+            try:
+                r = requests.post(url, json=payload, timeout=1200, stream=True)
+                if not r.ok:
+                    try:
+                        body = r.json().get("error", r.text[:200])
+                    except Exception:
+                        body = r.text[:200]
+                    raise RuntimeError(f"Ollama HTTP {r.status_code} (model={model}): {body}")
+
+                full_response = []
+                for line in r.iter_lines():
+                    if _shutdown.is_set():
+                        r.close()
+                        raise _ShutdownRequested()
+                    if line:
+                        data = json.loads(line)
+                        if "response" in data:
+                            full_response.append(data["response"])
+                        if data.get("done"):
+                            break
+                return "".join(full_response).strip()
+
+            except requests.exceptions.ConnectionError:
+                sys.exit(
+                    f"❌  Cannot reach Ollama at {OLLAMA_URL}\n"
+                    "    Is `ollama serve` running?"
+                )
+            except requests.exceptions.Timeout as exc:
+                if attempt == 1 and not _shutdown.is_set():
+                    print(f"     ⏱  Ollama timed out — restarting and retrying (model={model}) …")
+                    _ollama_restart_service()
+                    continue
+                raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
+            except (_ShutdownRequested, RuntimeError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
 
     # ── OpenClaw ──────────────────────────────────────────────────────────
     def _call_openclaw(self, prompt: str, model: str) -> str:
@@ -419,28 +453,45 @@ class Backend:
         cmd = ["openclaw", "agent", "--message", prompt]
 
         try:
-            result = subprocess.run(
+            # Using Popen + poll for interruptibility
+            with subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=1200,
                 env=env,
-            )
+            ) as proc:
+                deadline = time.time() + 1200
+                while proc.poll() is None:
+                    if _shutdown.is_set():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        return ""
+                    if time.time() > deadline:
+                        proc.kill()
+                        raise RuntimeError("OpenClaw agent timed out (>20 min)")
+                    time.sleep(1.0)
+
+                stdout, stderr = proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"openclaw agent exited {proc.returncode}: {stderr.strip() or '(no stderr)'}"
+                    )
+
+                output = stdout.strip()
+                if not output:
+                    raise RuntimeError("openclaw agent returned empty response")
+                return output
+
         except FileNotFoundError:
             sys.exit("❌  `openclaw` not found in PATH.")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("OpenClaw agent timed out (>20 min)")
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"openclaw agent exited {result.returncode}: {stderr or '(no stderr)'}"
-            )
-
-        output = result.stdout.strip()
-        if not output:
-            raise RuntimeError("openclaw agent returned empty response")
-        return output
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"OpenClaw error: {exc}") from exc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -490,6 +541,8 @@ def map_reduce_chunks(
     print(f"      ↳ Map-reduce: {len(chunks)} chunks …")
     partial: List[str] = []
     for idx, chunk in enumerate(chunks, 1):
+        if _shutdown.is_set():
+            raise _ShutdownRequested()
         prompt = (
             f"You are reading chunk {idx} of {len(chunks)} of an AI/ML research paper. "
             "Summarise this chunk concisely, preserving all technical details, "
@@ -678,13 +731,6 @@ class PaperProcessor:
 
         # Compute once — used for checkpoints throughout
         paper_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
-
-        # Condense multi-chunk papers to a manageable context string
-        context = map_reduce_chunks(chunks, self.backend, model)
-
-        # Cap to ~90k chars (~22k tokens) — safe for 32k-ctx models
-        capped = context[:90_000]
-
         completed: List[str] = list(meta.sections_completed) if meta else []
 
         def _checkpoint():
@@ -698,14 +744,28 @@ class PaperProcessor:
                 return True
             return False
 
+        # Condense multi-chunk papers to a manageable context string
+        try:
+            context = map_reduce_chunks(chunks, self.backend, model)
+        except _ShutdownRequested:
+            _checkpoint()
+            print(f"     ⚡  Stopped during map-reduce — {len(completed)} section(s) saved")
+            return
+
+        # Cap to ~90k chars (~22k tokens) — safe for 32k-ctx models
+        capped = context[:90_000]
+
         # ── 1. Summary ────────────────────────────────────────────────────
         if self._should_run("summary", completed):
             if _shutting_down():
                 return
             print("     📝  Summary …")
-            out = self.backend.call(
-                self._tag_prompt(PROMPTS["summary"], capped), model
-            )
+            try:
+                out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model)
+            except _ShutdownRequested:
+                _checkpoint()
+                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                return
             self._write_md(paper_dir / "01_summary.md", "Summary", out)
             if "summary" not in completed:
                 completed.append("summary")
@@ -717,14 +777,13 @@ class PaperProcessor:
             if _shutting_down():
                 return
             print("     🔣  Symbolic logic …")
-            out = self.backend.call(
-                self._tag_prompt(PROMPTS["logic"], capped), model
-            )
-            self._write_md(
-                paper_dir / "02_symbolic_logic.md",
-                "Symbolic Logic Formulation",
-                out,
-            )
+            try:
+                out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), model)
+            except _ShutdownRequested:
+                _checkpoint()
+                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                return
+            self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
             if "logic" not in completed:
                 completed.append("logic")
             _checkpoint()
@@ -735,14 +794,13 @@ class PaperProcessor:
             if _shutting_down():
                 return
             print(f"     💻  C++ examples  (model: {code_model}) …")
-            out = self.backend.call(
-                self._tag_prompt(PROMPTS["cpp"], capped), code_model
-            )
-            self._write_md(
-                paper_dir / "03_cpp_examples.md",
-                "C++ Implementation Examples",
-                out,
-            )
+            try:
+                out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model)
+            except _ShutdownRequested:
+                _checkpoint()
+                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                return
+            self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
             if "cpp" not in completed:
                 completed.append("cpp")
             _checkpoint()
@@ -753,11 +811,16 @@ class PaperProcessor:
             if _shutting_down():
                 return
             print("     📊  Graphviz diagrams …")
-            raw = self.backend.call(
-                self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
-                model,
-                ctx_tokens=32768,
-            )
+            try:
+                raw = self.backend.call(
+                    self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
+                    model,
+                    ctx_tokens=32768,
+                )
+            except _ShutdownRequested:
+                _checkpoint()
+                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                return
             diagrams = parse_diagrams(raw)
 
             if not diagrams:
@@ -789,9 +852,12 @@ class PaperProcessor:
             if _shutting_down():
                 return
             print("     💡  Extras / critical analysis …")
-            out = self.backend.call(
-                self._tag_prompt(PROMPTS["extras"], capped), model
-            )
+            try:
+                out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model)
+            except _ShutdownRequested:
+                _checkpoint()
+                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                return
             self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
             if "extras" not in completed:
                 completed.append("extras")
@@ -853,6 +919,28 @@ def health_check_ollama():
     except Exception as exc:
         print(f"  ❌  Cannot reach Ollama at {OLLAMA_URL}: {exc}")
         return False
+
+
+def check_required_models(models: List[str]) -> None:
+    """Exit with pull instructions if any model is absent from Ollama's local library.
+
+    Prevents auto-download hangs: missing models trigger a silent pull on first
+    generate request, which can exceed the 1200s timeout and cascade to all
+    subsequent papers (OLLAMA_NUM_PARALLEL=1 queues them behind the stuck request).
+    """
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        r.raise_for_status()
+        available = {m["name"] for m in r.json().get("models", [])}
+    except Exception:
+        return  # health_check_ollama already reported unreachable Ollama
+    missing = [m for m in models if m not in available]
+    if missing:
+        sys.exit(
+            "❌  Required models not found locally — pull them first to avoid "
+            "auto-download timeouts:\n"
+            + "\n".join(f"    ollama pull {m}" for m in missing)
+        )
 
 
 def health_check_openclaw():
@@ -958,6 +1046,16 @@ def main():
     if not ok:
         sys.exit(1)
 
+    if args.backend == "ollama":
+        models_to_check = (
+            [args.model]
+            if args.model
+            else list(dict.fromkeys(
+                [MODEL_TIERS[k] for _, k in TIER_BY_PAGES] + [CODE_MODEL]
+            ))
+        )
+        check_required_models(models_to_check)
+
     if args.override and args.backend == "ollama":
         provision_ollama(verbose=args.verbose)
 
@@ -1020,10 +1118,15 @@ def main():
                     pdf = futures[fut]
                     try:
                         fut.result()
+                    except _ShutdownRequested:
+                        pass
                     except Exception as exc:
                         msg = f"{pdf.name}: {exc}"
                         errors.append(msg)
                         print(f"  ❌  {msg}")
+                        if "timed out" in str(exc).lower():
+                            print("  🔄  Timeout detected — restarting Ollama to unblock next paper …")
+                            _ollama_restart_service()
                 if _shutdown.is_set():
                     print(f"  ⚡  Cancelling {len(remaining)} pending paper(s) …")
                     for f in remaining:
@@ -1036,10 +1139,15 @@ def main():
                 break
             try:
                 processor.process(pdf)
+            except _ShutdownRequested:
+                break
             except Exception as exc:
                 msg = f"{pdf.name}: {exc}"
                 errors.append(msg)
                 print(f"  ❌  {msg}")
+                if "timed out" in str(exc).lower():
+                    print("  🔄  Timeout detected — restarting Ollama to unblock next paper …")
+                    _ollama_restart_service()
 
     # ── Summary ────────────────────────────────────────────────────────────
     print(f"\n{'═'*64}")
