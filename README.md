@@ -179,6 +179,20 @@ Built and validated on a single 4-page paper through all five sections +
 six SVG diagrams. Runtime budget for a 5,000-paper corpus at average
 ~20-40 min/paper is measured in weeks, not hours — plan in batches.
 
+## Operator notes
+
+Workstation setup notes that aren't part of the pipeline itself —
+toolchain installs, environment provisioning, incident write-ups —
+live in [`docs/sessions/`](docs/sessions/). Each file is timestamped
+(`YYYY-MM-DDTHHMMSSZ_<topic>.md`) and self-contained.
+
+Recent additions on the `morlok` host include Python 3.13 venv setup,
+a zsh install, a from-source lite-xl build, and a Midnight Commander
+install with a user-local Dracula skin (`~/.local/share/mc/skins/`,
+selected via `~/.config/mc/ini`). None of these are required to run
+`paper_processor.py`; they document the operator environment so the
+state of the workstation can be reconstructed from the repo alone.
+
 ## Licence
 
 MIT
