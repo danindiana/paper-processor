@@ -90,6 +90,25 @@ GPU 1  RTX 3080   59°C      123–124 W / 340 W limit   fan: 67%
 
 ---
 
+## Summary
+
+| Item | RTX 5080 (GPU 0) | RTX 3080 (GPU 1) |
+|------|-----------------|-----------------|
+| Architecture | Blackwell | Ampere |
+| Target Temp control | Not supported (-gtt N/A) | 70°C (range 65–91°C) |
+| Thermal workaround | Power cap 300W (from 360W) | — |
+| Max Operating Temp | N/A (T.Limit offsets) | 93°C |
+| Slowdown Temp | T.Limit -2°C offset | 95°C |
+| Shutdown Temp | T.Limit -5°C offset | 98°C |
+| Margin to slowdown | N/A | 25°C |
+| Observed range (load) | 66–69°C / 200–213W | 59°C / 123–124W |
+| Fan (load) | 47–49% | 67% |
+| Persistence | gpu-eco-mode.service | gpu-eco-mode.service |
+
+No throttle events observed on either GPU during monitoring.
+
+---
+
 ## Commands Reference
 
 ```bash
