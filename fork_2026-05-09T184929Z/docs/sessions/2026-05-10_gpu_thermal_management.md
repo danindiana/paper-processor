@@ -64,6 +64,18 @@ GPU 0  RTX 5080   68°C   198 W / 300 W limit   Target Temp: N/A (firmware-manag
 GPU 1  RTX 3080   59°C   124 W / 340 W limit   Target Temp: 70°C
 ```
 
+## Thermal Thresholds
+
+| GPU | Max Operating | Slowdown | Shutdown |
+|-----|--------------|----------|----------|
+| RTX 5080 (Blackwell) | N/A (T.Limit offset: 0°C) | T.Limit offset: -2°C | T.Limit offset: -5°C |
+| RTX 3080 (Ampere) | 93°C | 95°C | 98°C |
+
+- RTX 3080 thresholds are absolute: throttles at 95°C, shuts down at 98°C. Our 70°C target leaves a 23°C margin to slowdown.
+- RTX 5080 (Blackwell) reports thresholds as offsets relative to an internal T.Limit value rather than fixed absolute temps — firmware-managed.
+
+---
+
 ## Extended Monitoring (sustained load observation)
 
 Monitored both GPUs over ~10 minutes under active inference load:
