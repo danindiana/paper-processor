@@ -8,7 +8,7 @@ The system utilizes two independent Ollama backends to enforce strict GPU pinnin
 
 ### GPU 0 (RTX 3080, 10GB)
 - **Constraint:** Context hard-capped at **8,192** tokens.
-- **Residency:** Holds both `deepseek-r1:8b` and `qwen3.5:4b` simultaneously (~8.6 GB).
+- **Residency:** Holds both `deepseek-r1:8b` and `qwen2.5-coder:7b` simultaneously (~9.6 GB raw; actual ~9.5 GB with 8k ctx cap).
 - **Service:** Port 11434 (`OLLAMA_NUM_PARALLEL=1`).
 
 ### GPU 1 (RTX 5080, 16GB)
