@@ -32,7 +32,7 @@ Investigate and implement temperature capping for the dual NVIDIA GPUs on this m
 - `GPU Target Temperature: N/A` — Blackwell architecture does not expose this control via nvidia-smi.
 - The GPU uses newer internal firmware-managed thermal control.
 - **Workaround: power cap.** Reducing the power limit indirectly caps heat output.
-- **Set to 275 W** (from default 360 W) — approximately 24% power reduction (revised down from 300 W).
+- **Set to 300 W** (from default 360 W) — approximately 17% power reduction.
 
 ---
 
@@ -48,7 +48,7 @@ Added to both `eco` and `perf` modes:
 ### 2. Live settings applied
 Settings were applied immediately without a reboot:
 ```
-RTX 5080: power limit 360 W → 275 W (revised from 300 W)
+RTX 5080: power limit 360 W → 300 W
 RTX 3080: GPU Target Temperature → 70°C (revised from 80°C)
 ```
 
@@ -60,7 +60,7 @@ RTX 3080: GPU Target Temperature → 70°C (revised from 80°C)
 ## Verified State (post-change)
 
 ```
-GPU 0  RTX 5080   68°C   198 W / 275 W limit   Target Temp: N/A (firmware-managed)
+GPU 0  RTX 5080   68°C   198 W / 300 W limit   Target Temp: N/A (firmware-managed)
 GPU 1  RTX 3080   59°C   124 W / 340 W limit   Target Temp: 70°C
 ```
 
@@ -89,5 +89,5 @@ sudo systemctl restart gpu-eco-mode.service
 
 ## Notes
 - The `-gtt` setting resets on driver reload; the `gpu-eco-mode.service` handles re-application at boot.
-- The RTX 5080's power cap (275 W) is conservative for inference workloads. Raise to 360 W (perf mode) if throughput bottlenecks appear.
+- The RTX 5080's power cap (300 W) is conservative for inference workloads. Raise to 360 W (perf mode) if throughput bottlenecks appear.
 - `nvidia-persistenced` must be running for persistence mode to hold across power state changes; it is enabled and active on this machine.
