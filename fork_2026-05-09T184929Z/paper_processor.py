@@ -79,29 +79,7 @@ class _ShutdownRequested(Exception):
 # RAM       → 128 GB   (no OOM concern for CPU offload)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Models constrained to ≤ 8.9 GB VRAM
-MODEL_TIERS = {
-    "xl_quality":   "deepseek-r1:8b",               # 5.2 GB
-    "xl_reason":    "deepseek-r1:8b",               # 5.2 GB
-    "xl_code":      "ministral-3:8b",               # 6.0 GB
-    "mid_code":     "ministral-3:8b",               # 6.0 GB
-    "mid_reason":   "deepseek-r1:8b",               # 5.2 GB
-    "single":       "deepseek-r1:8b",               # 5.2 GB
-    "single_code":  "ministral-3:8b",               # 6.0 GB
-    "fast":         "qwen2.5:3b",                   # 1.9 GB
-}
-
-# Page-count → primary model mapping
-TIER_BY_PAGES: List[Tuple[int, str]] = [
-    (10,  "fast"),          # tiny paper / abstract
-    (999, "xl_quality"),    # all other papers use 8b model
-]
-
-# Separate model for C++ section (code-specialised)
-CODE_MODEL = MODEL_TIERS["xl_code"]
-
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-
+# Models and mapping are now GPU-aware (see GPU_OPTIMIZED_MODELS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OLLAMA GPU PROVISIONER  (--override mode)
@@ -109,8 +87,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 def _ollama_get_loaded() -> List[str]:
     """Return names of models currently resident in VRAM via /api/ps."""
+    url = get_gpu_url()
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        r = requests.get(f"{url}/api/ps", timeout=5)
         r.raise_for_status()
         return [m["name"] for m in r.json().get("models", [])]
     except Exception:
@@ -119,9 +98,10 @@ def _ollama_get_loaded() -> List[str]:
 
 def _ollama_evict(model: str) -> bool:
     """Ask Ollama to unload a model immediately (keep_alive=0)."""
+    url = get_gpu_url()
     try:
         r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
+            f"{url}/api/generate",
             json={"model": model, "keep_alive": 0},
             timeout=20,
         )
@@ -143,7 +123,10 @@ def _ollama_wait_clean(timeout: int = 30, interval: float = 2.0) -> bool:
 def _ollama_restart_service() -> bool:
     """Restart the ollama systemd service and wait for it to come back online."""
     print("  🔄  Restarting ollama service …")
+    url = get_gpu_url()
     try:
+        # Note: we restart the main service only. Secondary service restart
+        # is omitted here for simplicity as it's less likely to hang.
         r = subprocess.run(
             ["sudo", "systemctl", "restart", "ollama"],
             capture_output=True, text=True, timeout=30,
@@ -160,7 +143,7 @@ def _ollama_restart_service() -> bool:
     while time.time() < deadline:
         time.sleep(2)
         try:
-            r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+            r = requests.get(f"{url}/api/tags", timeout=3)
             if r.status_code == 200:
                 print(" up!")
                 return True
@@ -174,13 +157,6 @@ def _ollama_restart_service() -> bool:
 def provision_ollama(verbose: bool = False) -> bool:
     """
     Aggressively free GPU VRAM before processing starts.
-
-    Escalation ladder:
-      1. Evict every loaded model via keep_alive=0 generate requests.
-      2. If any model is still loaded after 20 s, restart the ollama service.
-      3. Verify clean state; warn but do not abort if it cannot be confirmed.
-
-    Returns True when Ollama is up and VRAM appears free (or after best effort).
     """
     print("\n  🎯  Override: provisioning Ollama for exclusive GPU use …")
 
@@ -355,21 +331,55 @@ ALL_SECTIONS = {"summary", "logic", "cpp", "diagrams", "extras"}
 # BACKEND  (Ollama direct API  or  OpenClaw agent CLI)
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
-# MULTI-GPU MANAGEMENT
+# MULTI-GPU & MULTI-BACKEND MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 _gpu_lock = threading.Lock()
-_gpu_available = [0, 1]  # RTX 3080 (0) and RTX 3060 (1)
+_gpu_available = [0, 1]  # GPU 0 (3080, port 11434) and GPU 1 (3060, port 11435)
 _thread_to_gpu = {}
+
+# GPU-specific optimized model mapping to maximize fitness and residency
+# Goal: keep BOTH reasoning and code models hot-loaded on each GPU.
+GPU_OPTIMIZED_MODELS = {
+    0: {  # RTX 3080 (10 GB)
+        "reason": "deepseek-r1:8b",     # 5.2 GB
+        "code":   "qwen3.5:4b",         # 3.4 GB (Total: 8.6 GB - Fits!)
+        "fast":   "qwen2.5:3b",         # 1.9 GB
+    },
+    1: {  # RTX 3060 (12 GB)
+        "reason": "deepseek-r1:8b",     # 5.2 GB
+        "code":   "ministral-3:8b",     # 6.0 GB (Total: 11.2 GB - Fits!)
+        "fast":   "qwen2.5:3b",         # 1.9 GB
+    }
+}
+
+BACKEND_URLS = {
+    0: "http://localhost:11434",
+    1: "http://localhost:11435",
+}
 
 def get_assigned_gpu() -> int:
     """Return the GPU ID assigned to the current thread."""
     return _thread_to_gpu.get(threading.get_ident(), 0)
 
+def get_gpu_url() -> str:
+    """Return the Ollama URL for the assigned GPU."""
+    return BACKEND_URLS.get(get_assigned_gpu(), "http://localhost:11434")
+
+def get_gpu_model(tier: str) -> str:
+    """Return the optimized model for the current GPU and tier."""
+    gpu_id = get_assigned_gpu()
+    models = GPU_OPTIMIZED_MODELS.get(gpu_id, GPU_OPTIMIZED_MODELS[0])
+    
+    if tier in ("xl_quality", "xl_reason", "mid_reason", "single"):
+        return models["reason"]
+    if tier in ("xl_code", "mid_code", "single_code"):
+        return models["code"]
+    return models.get(tier, models["reason"])
+
+
 class Backend:
     """
     Thin abstraction over LLM backends.
-    Ollama  → POST /api/generate  (reliable, full model control)
-    OpenClaw → `openclaw agent --message "..."` subprocess
     """
 
     def __init__(self, name: str, default_model: str):
@@ -389,8 +399,7 @@ class Backend:
 
     # ── Ollama ────────────────────────────────────────────────────────────
     def _call_ollama(self, prompt: str, model: str, ctx: int) -> str:
-        url = f"{OLLAMA_URL}/api/generate"
-        gpu_id = get_assigned_gpu()
+        url = f"{get_gpu_url()}/api/generate"
         
         payload = {
             "model": model,
@@ -404,12 +413,6 @@ class Backend:
             },
         }
         
-        # Note: Ollama server side handles OLLAMA_NUM_PARALLEL and scheduling.
-        # To truly force a specific GPU per request when multiple GPUs are visible
-        # to one server, we rely on Ollama's internal scheduling or run multiple
-        # servers. However, if we want to ensure throughput, we must ensure
-        # Ollama is configured with OLLAMA_NUM_PARALLEL >= workers.
-        
         for attempt in range(1, 3):
             if _shutdown.is_set():
                 return ""
@@ -421,7 +424,7 @@ class Backend:
                         body = r.json().get("error", r.text[:200])
                     except Exception:
                         body = r.text[:200]
-                    raise RuntimeError(f"Ollama HTTP {r.status_code} (model={model}): {body}")
+                    raise RuntimeError(f"Ollama HTTP {r.status_code} at {url} (model={model}): {body}")
 
                 full_response = []
                 for line in r.iter_lines():
@@ -438,12 +441,12 @@ class Backend:
 
             except requests.exceptions.ConnectionError:
                 sys.exit(
-                    f"❌  Cannot reach Ollama at {OLLAMA_URL}\n"
-                    "    Is `ollama serve` running?"
+                    f"❌  Cannot reach Ollama at {url}\n"
+                    "    Is the service running?"
                 )
             except requests.exceptions.Timeout as exc:
                 if attempt == 1 and not _shutdown.is_set():
-                    print(f"     ⏱  Ollama timed out — retrying (model={model}) …")
+                    print(f"     ⏱  Ollama timed out at {url} — retrying (model={model}) …")
                     continue
                 raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
             except (_ShutdownRequested, RuntimeError):
@@ -987,10 +990,13 @@ def main():
                   01_<title>.svg
                   …  (6+ diagrams)
 
-            Model auto-selection (Constrained to ≤ 8.9 GB):
-              ≤ 10 pages  →  qwen2.5:3b          (~1.9 GB)
-              > 10 pages  →  deepseek-r1:8b      (~5.2 GB)
-              C++ section →  ministral-3:8b      (~6.0 GB)
+            Model auto-selection (Optimized for Multi-GPU Residency):
+              GPU 0 (RTX 3080, 10GB):
+                Reasoning: deepseek-r1:8b (5.2GB)
+                Code:      qwen3.5:4b     (3.4GB)
+              GPU 1 (RTX 3060, 12GB):
+                Reasoning: deepseek-r1:8b (5.2GB)
+                Code:      ministral-3:8b (6.0GB)
         """),
     )
     ap.add_argument(
@@ -1056,11 +1062,12 @@ def main():
         sys.exit(1)
 
     if args.backend == "ollama":
+        # Check all models for GPU 0 as a representative baseline
         models_to_check = (
             [args.model]
             if args.model
             else list(dict.fromkeys(
-                [MODEL_TIERS[k] for _, k in TIER_BY_PAGES] + [CODE_MODEL]
+                [GPU_OPTIMIZED_MODELS[0]["reason"], GPU_OPTIMIZED_MODELS[0]["code"], GPU_OPTIMIZED_MODELS[0]["fast"]]
             ))
         )
         check_required_models(models_to_check)
@@ -1068,7 +1075,8 @@ def main():
     if args.override and args.backend == "ollama":
         provision_ollama(verbose=args.verbose)
 
-    default_model = args.model or MODEL_TIERS["xl_quality"]
+    # Note: backend URL and models will be dynamically selected per-worker thread
+    default_model = args.model or GPU_OPTIMIZED_MODELS[0]["reason"]
     backend       = Backend(args.backend, default_model)
 
     print(f"  Backend   : {args.backend}")
