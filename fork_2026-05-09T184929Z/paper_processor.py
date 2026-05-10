@@ -864,7 +864,7 @@ class PaperProcessor:
             try:
                 raw = self.backend.call(
                     self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
-                    model,
+                    code_model,  # DOT generation is a structured-output/code task
                     ctx_tokens=32768,
                 )
             except _ShutdownRequested:
@@ -989,6 +989,27 @@ def check_required_models(models: List[str]) -> None:
         )
 
 
+def prewarm_models() -> None:
+    """Send a 1-token ping to each model on each GPU to force load before first paper."""
+    print("  🔥  Pre-warming models …")
+    for gpu_id, url in BACKEND_URLS.items():
+        models = GPU_OPTIMIZED_MODELS.get(gpu_id, GPU_OPTIMIZED_MODELS[0])
+        for tier in ("reason", "code"):
+            model = models[tier]
+            try:
+                payload = {
+                    "model": model,
+                    "prompt": "hi",
+                    "stream": False,
+                    "options": {"num_ctx": 512, "num_predict": 1},
+                }
+                r = requests.post(f"{url}/api/generate", json=payload, timeout=120)
+                status = "✓" if r.ok else f"✗ HTTP {r.status_code}"
+            except Exception as exc:
+                status = f"✗ {exc}"
+            print(f"     GPU {gpu_id}  {model:<32} {status}")
+
+
 def health_check_openclaw():
     try:
         r = subprocess.run(
@@ -1024,12 +1045,13 @@ def main():
                   …  (6+ diagrams)
 
             Model auto-selection (Optimized for Multi-GPU Residency):
-              GPU 0 (RTX 3080, 10GB):
-                Reasoning: deepseek-r1:8b (5.2GB)
-                Code:      qwen2.5-coder:7b (4.4GB)
-              GPU 1 (RTX 5080, 16GB):
-                Reasoning: deepseek-r1:8b (5.2GB)
-                Code:      ministral-3:8b (6.0GB)
+              GPU 0 (RTX 3080, 10GB, 8k ctx):
+                Reasoning/Summary/Logic/Extras: deepseek-r1:8b (5.2GB)
+                Code/Diagrams:                  qwen2.5-coder:7b (4.4GB)
+              GPU 1 (RTX 5080, 16GB, 32k ctx):
+                Reasoning/Summary/Logic/Extras: deepseek-r1:8b (5.2GB)
+                Code/Diagrams:                  ministral-3:8b (6.0GB)
+              Routing: papers >20 pages are preferred to GPU 1 (larger context).
         """),
     )
     ap.add_argument(
@@ -1050,8 +1072,8 @@ def main():
         help="Process a single paper by filename (e.g. 'attention.pdf')",
     )
     ap.add_argument(
-        "--workers", type=int, default=1, metavar="N",
-        help="Parallel paper workers — keep at 1 unless papers are small (VRAM limit)",
+        "--workers", type=int, default=2, metavar="N",
+        help="Parallel paper workers [default: 2 — uses both GPUs]",
     )
     ap.add_argument(
         "--list", action="store_true",
@@ -1108,6 +1130,9 @@ def main():
     if args.override and args.backend == "ollama":
         provision_ollama(verbose=args.verbose)
 
+    if args.backend == "ollama":
+        prewarm_models()
+
     # Note: backend URL and models will be dynamically selected per-worker thread
     default_model = args.model or GPU_OPTIMIZED_MODELS[0]["reason"]
     backend       = Backend(args.backend, default_model)
@@ -1156,16 +1181,30 @@ def main():
     errors: List[str] = []
 
     def _worker_wrapper(pdf: Path):
+        # Quick page-count for GPU routing — fitz.open() on metadata only, very fast
+        try:
+            _doc = fitz.open(str(pdf))
+            _pages = _doc.page_count
+            _doc.close()
+        except Exception:
+            _pages = 0
+
         gpu_id = None
         with _gpu_lock:
-            if _gpu_available:
+            if not _gpu_available:
+                gpu_id = 0  # fallback: all GPUs busy
+            elif len(_gpu_available) == 1:
                 gpu_id = _gpu_available.pop(0)
             else:
-                # Fallback if more workers than GPUs (should not happen with workers=2)
-                gpu_id = 0
-        
+                # Both GPUs free: prefer GPU 1 (RTX 5080, 32k ctx) for long papers
+                if _pages > 20 and 1 in _gpu_available:
+                    _gpu_available.remove(1)
+                    gpu_id = 1
+                else:
+                    gpu_id = _gpu_available.pop(0)
+
         _thread_to_gpu[threading.get_ident()] = gpu_id
-        print(f"  🚀  Assigned GPU {gpu_id} to {pdf.name}")
+        print(f"  🚀  Assigned GPU {gpu_id} to {pdf.name} ({_pages} pages)")
         
         try:
             processor.process(pdf)
