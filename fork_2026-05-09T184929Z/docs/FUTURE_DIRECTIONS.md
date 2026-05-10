@@ -72,19 +72,30 @@ fewer delimiter and syntax errors.
 ---
 
 ### 2b. Tiered model selection for section complexity *(Medium impact / Low effort)*
-**Status:** TODO
+**Status:** DONE (2026-05-10)
 
 Not all sections need the full reasoning model. `extras` (critical analysis) benefits
-from deep reasoning; `logic` (symbolic notation) is largely mechanical. A three-tier
-dispatch table would cut token spend and latency on lighter sections:
+from deep reasoning; `logic` (symbolic notation) is largely mechanical. Implemented
+in two parts:
 
-| Section   | Suggested tier | Rationale |
-|-----------|----------------|-----------|
-| summary   | reason         | Requires synthesis across chunks |
-| logic     | fast           | Mechanical symbolic transcription |
-| cpp       | code           | Already uses code model |
-| diagrams  | code           | Already switched (2a above) |
-| extras    | reason         | Requires evaluation and critique |
+1. **Logic routed to code_model** — `qwen2.5-coder:7b` / `ministral-3:8b` instead of
+   `deepseek-r1:8b`. Formal notation is structured output; code models handle it well
+   without chain-of-thought overhead (which was generating ~5k extra reasoning tokens).
+
+2. **`num_predict` caps added per section** — `backend.call()` now accepts `max_tokens`
+   which maps to Ollama's `num_predict`. Caps applied:
+
+| Section   | Model tier | `num_predict` | Rationale |
+|-----------|------------|---------------|-----------|
+| summary   | reason     | 2048          | Comprehensive but focused |
+| logic     | code       | 1536          | Formal notation is compact |
+| cpp       | code       | 2048          | Code needs space, not essays |
+| diagrams  | code       | unlimited     | Structured blocks must complete |
+| extras    | reason     | 2048          | Deep analysis, bounded |
+
+Expected win: ~70% reduction in per-section wall time for large papers.
+Previously: extras=316s, logic=554s, cpp=819s on a 42-page paper.
+Target: all sections under 120s.
 
 ---
 
@@ -192,6 +203,5 @@ recover from transient Ollama contention without manual `--reprocess`.
 | ✅ Done  | 3b — keep-alive heartbeat | Low |
 | ✅ Done  | 1a — parallel sections | Medium |
 | ✅ Done  | 5a — per-paper timing in metadata | Low |
-| **Future** | 2b — tiered model selection | Low |
-| **Future** | 2b — tiered model selection | Low |
+| ✅ Done  | 2b — tiered model + num_predict caps | Low |
 | **Future** | 4 — batch reprocess diagrams | Ops task |

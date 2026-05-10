@@ -397,35 +397,40 @@ class Backend:
         prompt: str,
         model: Optional[str] = None,
         ctx_tokens: int = 32768,
+        max_tokens: Optional[int] = None,
     ) -> str:
         m = model or self.default_model
         gpu_id = get_assigned_gpu()
-        
+
         # GPU-specific context window limits to preserve VRAM residency
         # GPU 0 (3080, 10GB) capped at 8k to fit reasoning + code models
         # GPU 1 (5080, 16GB) allowed full 32k
         effective_ctx = ctx_tokens
         if gpu_id == 0:
             effective_ctx = min(ctx_tokens, 8192)
-            
+
         if self.name == "ollama":
-            return self._call_ollama(prompt, m, effective_ctx)
+            return self._call_ollama(prompt, m, effective_ctx, max_tokens)
         return self._call_openclaw(prompt, m)
 
     # ── Ollama ────────────────────────────────────────────────────────────
-    def _call_ollama(self, prompt: str, model: str, ctx: int) -> str:
+    def _call_ollama(self, prompt: str, model: str, ctx: int, max_tokens: Optional[int] = None) -> str:
         url = f"{get_gpu_url()}/api/generate"
-        
+
+        opts: dict = {
+            "num_ctx":        ctx,
+            "temperature":    0.20,
+            "top_p":          0.90,
+            "repeat_penalty": 1.10,
+        }
+        if max_tokens is not None:
+            opts["num_predict"] = max_tokens
+
         payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": True,
-            "options": {
-                "num_ctx":        ctx,
-                "temperature":    0.20,
-                "top_p":          0.90,
-                "repeat_penalty": 1.10,
-            },
+            "model":   model,
+            "prompt":  prompt,
+            "stream":  True,
+            "options": opts,
         }
         
         for attempt in range(1, 3):
@@ -820,7 +825,7 @@ class PaperProcessor:
             print("     📝  Summary …")
             t0 = time.monotonic()
             try:
-                out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model)
+                out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model, max_tokens=2048)
             except _ShutdownRequested:
                 _checkpoint()
                 print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
@@ -860,8 +865,8 @@ class PaperProcessor:
             _pin()
             t0 = time.monotonic()
             try:
-                print("     🔣  Symbolic logic …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), model)
+                print(f"     🔣  Symbolic logic  (model: {code_model}) …")
+                out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), code_model, max_tokens=1536)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
@@ -879,7 +884,7 @@ class PaperProcessor:
             t0 = time.monotonic()
             try:
                 print(f"     💻  C++ examples  (model: {code_model}) …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model)
+                out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model, max_tokens=2048)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
@@ -950,7 +955,7 @@ class PaperProcessor:
             t0 = time.monotonic()
             try:
                 print("     💡  Extras / critical analysis …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model)
+                out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model, max_tokens=2048)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
