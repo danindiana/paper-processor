@@ -64,6 +64,18 @@ GPU 0  RTX 5080   68°C   198 W / 300 W limit   Target Temp: N/A (firmware-manag
 GPU 1  RTX 3080   59°C   124 W / 340 W limit   Target Temp: 70°C
 ```
 
+## Extended Monitoring (sustained load observation)
+
+Monitored both GPUs over ~10 minutes under active inference load:
+
+```
+GPU 0  RTX 5080   66–69°C   200–213 W / 300 W limit   fan: 47–49%
+GPU 1  RTX 3080   59°C      123–124 W / 340 W limit   fan: 67%
+```
+
+- 5080 cycled between 66–69°C — 300W cap preventing further climb; no thermal throttle events observed.
+- 3080 rock-solid at 59°C, well below its 70°C target; fan holding at 67% to maintain that margin.
+
 ---
 
 ## Commands Reference
