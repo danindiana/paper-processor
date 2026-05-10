@@ -11,7 +11,7 @@ Items are grouped by theme and ranked within each group by impact-to-effort rati
 ## 1. Throughput & GPU Utilisation
 
 ### 1a. Parallel sections after map-reduce *(High impact / Medium effort)*
-**Status:** TODO
+**Status:** DONE (2026-05-10)
 
 After `map_reduce_chunks()` completes, all five sections (`summary`, `logic`, `cpp`,
 `diagrams`, `extras`) independently consume the same `capped` context string.
@@ -110,7 +110,7 @@ cold-load penalty on the first paper.
 ---
 
 ### 3b. Keep-alive heartbeat thread *(Low-Medium impact / Low effort)*
-**Status:** TODO
+**Status:** DONE (2026-05-10)
 
 `OLLAMA_KEEP_ALIVE=5m` evicts models after 5 minutes of inactivity. During a large
 batch run, slow papers (>5 min each) cause model eviction between papers. A
@@ -187,8 +187,9 @@ recover from transient Ollama contention without manual `--reprocess`.
 | ✅ Done  | 1c — route long papers → GPU 1 | Low |
 | ✅ Done  | 2a — diagrams use code model | Trivial |
 | ✅ Done  | 3a — pre-warm models at startup | Low |
-| **Next** | 3b — keep-alive heartbeat | Low |
+| ✅ Done  | 3b — keep-alive heartbeat | Low |
+| ✅ Done  | 1a — parallel sections | Medium |
 | **Next** | 5a — per-paper timing in metadata | Low |
-| **Future** | 1a — parallel sections | Medium |
+| **Future** | 2b — tiered model selection | Low |
 | **Future** | 2b — tiered model selection | Low |
 | **Future** | 4 — batch reprocess diagrams | Ops task |

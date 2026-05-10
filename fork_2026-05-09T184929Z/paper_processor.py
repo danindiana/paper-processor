@@ -822,100 +822,132 @@ class PaperProcessor:
             _checkpoint()
             print("         ✓")
 
-        # ── 2. Symbolic Logic ─────────────────────────────────────────────
-        if self._should_run("logic", completed):
-            if _shutting_down():
+        # ── Sections 2-5: fan out in parallel ─────────────────────────────────
+        # All four consume `capped` independently — no inter-section dependencies.
+        # GPU 1 (OLLAMA_NUM_PARALLEL=2): up to 2 sections run simultaneously.
+        # GPU 0 (OLLAMA_NUM_PARALLEL=1): requests pipeline, eliminating Python
+        # dispatch overhead even though Ollama serialises generation.
+
+        parent_gpu_id = get_assigned_gpu()
+        _sec_lock = threading.Lock()  # guards `completed` mutations + checkpoint writes
+
+        def _pin():
+            _thread_to_gpu[threading.get_ident()] = parent_gpu_id
+
+        def _unpin():
+            _thread_to_gpu.pop(threading.get_ident(), None)
+
+        def _complete(name: str):
+            with _sec_lock:
+                if name not in completed:
+                    completed.append(name)
+                _checkpoint()
+
+        def _run_logic():
+            if not self._should_run("logic", completed) or _shutdown.is_set():
                 return
-            print("     🔣  Symbolic logic …")
+            _pin()
             try:
+                print("     🔣  Symbolic logic …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), model)
+                if _shutdown.is_set():
+                    return
+                self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
+                _complete("logic")
+                print("         ✓ logic")
             except _ShutdownRequested:
-                _checkpoint()
-                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
-                return
-            self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
-            if "logic" not in completed:
-                completed.append("logic")
-            _checkpoint()
-            print("         ✓")
+                pass
+            finally:
+                _unpin()
 
-        # ── 3. C++ Examples ───────────────────────────────────────────────
-        if self._should_run("cpp", completed):
-            if _shutting_down():
+        def _run_cpp():
+            if not self._should_run("cpp", completed) or _shutdown.is_set():
                 return
-            print(f"     💻  C++ examples  (model: {code_model}) …")
+            _pin()
             try:
+                print(f"     💻  C++ examples  (model: {code_model}) …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model)
+                if _shutdown.is_set():
+                    return
+                self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
+                _complete("cpp")
+                print("         ✓ cpp")
             except _ShutdownRequested:
-                _checkpoint()
-                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
-                return
-            self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
-            if "cpp" not in completed:
-                completed.append("cpp")
-            _checkpoint()
-            print("         ✓")
+                pass
+            finally:
+                _unpin()
 
-        # ── 4. Graphviz Diagrams ──────────────────────────────────────────
-        if self._should_run("diagrams", completed):
-            if _shutting_down():
+        def _run_diagrams():
+            if not self._should_run("diagrams", completed) or _shutdown.is_set():
                 return
-            print("     📊  Graphviz diagrams …")
+            _pin()
             try:
+                print("     📊  Graphviz diagrams …")
                 raw = self.backend.call(
                     self._tag_prompt(DIAGRAM_PROMPT, capped[:60_000]),
-                    code_model,  # DOT generation is a structured-output/code task
+                    code_model,
                     ctx_tokens=32768,
                 )
+                if _shutdown.is_set():
+                    return
+                diagrams = parse_diagrams(raw)
+                if not diagrams:
+                    raw_out = paper_dir / "diagrams" / "_raw_llm_output.txt"
+                    raw_out.write_text(raw, encoding="utf-8")
+                    print(
+                        f"     ⚠️   No diagrams parsed from LLM output.\n"
+                        f"          Raw output saved → {raw_out}\n"
+                        f"          Tip: re-run with --reprocess diagrams after inspecting output."
+                    )
+                else:
+                    for idx, (title, dot_src) in enumerate(diagrams, 1):
+                        dot_src  = sanitize_dot(ensure_neon_black(dot_src))
+                        safe     = re.sub(r"[^\w\-]", "_", title)[:40].lower().strip("_")
+                        dot_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.dot"
+                        svg_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.svg"
+                        dot_path.write_text(dot_src, encoding="utf-8")
+                        ok     = render_dot(dot_src, svg_path)
+                        status = "✓" if ok else "✗ (dot saved, SVG render failed)"
+                        print(f"       {idx}. {title:<45} {status}")
+                _complete("diagrams")
             except _ShutdownRequested:
-                _checkpoint()
-                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
+                pass
+            finally:
+                _unpin()
+
+        def _run_extras():
+            if not self._should_run("extras", completed) or _shutdown.is_set():
                 return
-            diagrams = parse_diagrams(raw)
-
-            if not diagrams:
-                # Save raw output so user can inspect / manually extract DOT
-                raw_out = paper_dir / "diagrams" / "_raw_llm_output.txt"
-                raw_out.write_text(raw, encoding="utf-8")
-                print(
-                    f"     ⚠️   No diagrams parsed from LLM output.\n"
-                    f"          Raw output saved → {raw_out}\n"
-                    f"          Tip: re-run with --reprocess diagrams after inspecting output."
-                )
-            else:
-                for idx, (title, dot_src) in enumerate(diagrams, 1):
-                    dot_src  = sanitize_dot(ensure_neon_black(dot_src))
-                    safe     = re.sub(r"[^\w\-]", "_", title)[:40].lower().strip("_")
-                    dot_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.dot"
-                    svg_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.svg"
-                    dot_path.write_text(dot_src, encoding="utf-8")
-                    ok     = render_dot(dot_src, svg_path)
-                    status = "✓" if ok else "✗ (dot saved, SVG render failed)"
-                    print(f"       {idx}. {title:<45} {status}")
-
-            if "diagrams" not in completed:
-                completed.append("diagrams")
-            _checkpoint()
-
-        # ── 5. Extras ─────────────────────────────────────────────────────
-        if self._should_run("extras", completed):
-            if _shutting_down():
-                return
-            print("     💡  Extras / critical analysis …")
+            _pin()
             try:
+                print("     💡  Extras / critical analysis …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model)
+                if _shutdown.is_set():
+                    return
+                self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
+                _complete("extras")
+                print("         ✓ extras")
             except _ShutdownRequested:
-                _checkpoint()
-                print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
-                return
-            self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
-            if "extras" not in completed:
-                completed.append("extras")
-            _checkpoint()
-            print("         ✓")
+                pass
+            finally:
+                _unpin()
+
+        with ThreadPoolExecutor(max_workers=4) as _sec_pool:
+            _sec_futs = [
+                _sec_pool.submit(_run_logic),
+                _sec_pool.submit(_run_cpp),
+                _sec_pool.submit(_run_diagrams),
+                _sec_pool.submit(_run_extras),
+            ]
+            for _fut in as_completed(_sec_futs):
+                try:
+                    _fut.result()
+                except Exception as _exc:
+                    print(f"     ❌  Section error: {_exc}")
 
         # ── Write / update metadata ────────────────────────────────────────
-        _checkpoint()
+        with _sec_lock:
+            _checkpoint()
         print(f"     ✅  Output → {paper_dir}")
 
 
@@ -987,6 +1019,31 @@ def check_required_models(models: List[str]) -> None:
             "auto-download timeouts:\n"
             + "\n".join(f"    ollama pull {m}" for m in missing)
         )
+
+
+def _start_keepalive_heartbeat() -> None:
+    """Daemon thread: pings every model on every GPU every 4 min to prevent eviction."""
+    def _beat():
+        while not _shutdown.is_set():
+            time.sleep(240)  # just under OLLAMA_KEEP_ALIVE=5m
+            if _shutdown.is_set():
+                return
+            for gpu_id, url in BACKEND_URLS.items():
+                if _shutdown.is_set():
+                    return
+                for tier in ("reason", "code"):
+                    model = GPU_OPTIMIZED_MODELS.get(gpu_id, GPU_OPTIMIZED_MODELS[0])[tier]
+                    try:
+                        requests.post(
+                            f"{url}/api/generate",
+                            json={"model": model, "prompt": " ", "stream": False,
+                                  "options": {"num_ctx": 64, "num_predict": 1}},
+                            timeout=30,
+                        )
+                    except Exception:
+                        pass  # transient errors are non-fatal for a heartbeat
+
+    threading.Thread(target=_beat, daemon=True, name="keepalive-heartbeat").start()
 
 
 def prewarm_models() -> None:
@@ -1132,6 +1189,7 @@ def main():
 
     if args.backend == "ollama":
         prewarm_models()
+        _start_keepalive_heartbeat()
 
     # Note: backend URL and models will be dynamically selected per-worker thread
     default_model = args.model or GPU_OPTIMIZED_MODELS[0]["reason"]
