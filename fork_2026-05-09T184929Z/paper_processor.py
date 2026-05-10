@@ -74,7 +74,7 @@ class _ShutdownRequested(Exception):
 # ══════════════════════════════════════════════════════════════════════════════
 # HARDWARE CONTEXT
 # RTX 3080  → 10 240 MiB VRAM   (GPU 0, display attached)
-# RTX 3060  → 12 288 MiB VRAM   (GPU 1)
+# RTX 5080  → 16 376 MiB VRAM   (GPU 1)
 # Total     →  ~22 GB  (Ollama auto-spans with CUDA_VISIBLE_DEVICES or its own scheduler)
 # RAM       → 128 GB   (no OOM concern for CPU offload)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -279,13 +279,15 @@ DIAGRAM_PROMPT = textwrap.dedent("""\
     ══ MANDATORY VISUAL STYLE (apply to EVERY diagram) ══
       graph-level:  bgcolor="black"
       node default: style=filled, fillcolor="#0a0a0a", fontname="Courier New", fontsize=11
-      Use NEON accent colours for borders, labels, and edges. Pick from:
-        Electric Green  #00FF41    Hot Magenta  #FF00FF    Cyan      #00FFFF
-        Neon Orange     #FF6600    Volt Yellow  #FFFF00    Hot Pink  #FF0055
-        Chartreuse      #7FFF00    Electric Blue #0080FF   Lavender  #DA70FF
-      Edges: penwidth=2.0, use neon colours (vary per diagram)
-      Graph titles: use label= and labelloc=t with a bright fontcolor
-      Mix rankdir=LR and rankdir=TB between diagrams for variety.
+      NEON accent hex colours — ALWAYS quoted in attributes:
+        "#00FF41"  "#FF00FF"  "#00FFFF"  "#FF6600"  "#FFFF00"
+        "#FF0055"  "#7FFF00"  "#0080FF"  "#DA70FF"
+      Example:  node [color="#00FF41"]  — NEVER write  color=Electric Green
+      Edges: penwidth=2.0, vary neon colour per diagram
+      Graph titles: label= + labelloc=t with a bright fontcolor
+      Mix rankdir=LR and rankdir=TB between diagrams.
+      Node IDs: letters/digits/underscores ONLY — no spaces, ?, /, etc.
+      Use quoted labels for display text:  CONVERGE [label="Converge?"]
 
     ══ OUTPUT FORMAT — strictly follow this delimiter pattern ══
     ===DIAGRAM_START: <Descriptive Title for Diagram N>===
@@ -341,14 +343,14 @@ _thread_to_gpu = {}
 # Goal: keep BOTH reasoning and code models hot-loaded on each GPU.
 GPU_OPTIMIZED_MODELS = {
     0: {  # RTX 3080 (10 GB)
-        "reason": "deepseek-r1:8b",     # 5.2 GB
-        "code":   "qwen3.5:4b",         # 3.4 GB (Total: 8.6 GB - Fits!)
-        "fast":   "qwen2.5:3b",         # 1.9 GB
+        "reason": "deepseek-r1:8b",      # 5.2 GB
+        "code":   "qwen2.5-coder:7b",    # 4.4 GB (Total: 9.6 GB — tight; 8k ctx cap keeps actual VRAM ~9.5 GB)
+        "fast":   "qwen2.5:3b",          # 1.9 GB
     },
-    1: {  # RTX 3060 (12 GB)
-        "reason": "deepseek-r1:8b",     # 5.2 GB
-        "code":   "ministral-3:8b",     # 6.0 GB (Total: 11.2 GB - Fits!)
-        "fast":   "qwen2.5:3b",         # 1.9 GB
+    1: {  # RTX 5080 (16 GB)
+        "reason": "deepseek-r1:8b",      # 5.2 GB
+        "code":   "ministral-3:8b",      # 6.0 GB (Total: 11.2 GB — Fits!)
+        "fast":   "qwen2.5:3b",          # 1.9 GB
     }
 }
 
@@ -579,7 +581,7 @@ def map_reduce_chunks(
 # DIAGRAM  PARSING  +  RENDERING
 # ══════════════════════════════════════════════════════════════════════════════
 _DELIM_RE = re.compile(
-    r"===DIAGRAM_START:\s*(.+?)===\s*(.*?)===DIAGRAM_END===",
+    r"===DIAGRAM_START:\s*(.+?)===\s*(.*?)===DIAGRAM_END[^\n]*",
     re.DOTALL | re.IGNORECASE,
 )
 # Fallback: bare ``` or ```dot fences
@@ -622,6 +624,31 @@ def ensure_neon_black(dot_src: str) -> str:
     return dot_src
 
 
+_COLOR_NAMES = {
+    "Electric Green": "#00FF41", "Hot Magenta": "#FF00FF",
+    "Cyan":           "#00FFFF", "Neon Orange":  "#FF6600",
+    "Volt Yellow":    "#FFFF00", "Hot Pink":     "#FF0055",
+    "Chartreuse":     "#7FFF00", "Electric Blue":"#0080FF",
+    "Lavender":       "#DA70FF",
+}
+
+
+def sanitize_dot(dot_src: str) -> str:
+    """Replace bare LLM color names with hex codes and strip any content after the closing brace."""
+    for name, hex_code in _COLOR_NAMES.items():
+        dot_src = re.sub(
+            rf'(=\s*){re.escape(name)}(?=[;\]\s,\n]|$)',
+            rf'\1"{hex_code}"',
+            dot_src,
+            flags=re.IGNORECASE,
+        )
+    # Trim any raw LLM delimiter text that leaked past the closing brace
+    last_brace = dot_src.rfind("}")
+    if last_brace != -1:
+        dot_src = dot_src[: last_brace + 1]
+    return dot_src
+
+
 def render_dot(dot_src: str, out_svg: Path) -> bool:
     try:
         r = subprocess.run(
@@ -631,6 +658,8 @@ def render_dot(dot_src: str, out_svg: Path) -> bool:
             capture_output=True,
             timeout=30,
         )
+        if r.returncode != 0 and r.stderr.strip():
+            print(f"      ⚠️  dot error: {r.stderr.strip()[:200]}")
         return r.returncode == 0
     except FileNotFoundError:
         print("      ⚠️  graphviz `dot` not found — SVGs will not be rendered")
@@ -855,7 +884,7 @@ class PaperProcessor:
                 )
             else:
                 for idx, (title, dot_src) in enumerate(diagrams, 1):
-                    dot_src  = ensure_neon_black(dot_src)
+                    dot_src  = sanitize_dot(ensure_neon_black(dot_src))
                     safe     = re.sub(r"[^\w\-]", "_", title)[:40].lower().strip("_")
                     dot_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.dot"
                     svg_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.svg"
@@ -997,8 +1026,8 @@ def main():
             Model auto-selection (Optimized for Multi-GPU Residency):
               GPU 0 (RTX 3080, 10GB):
                 Reasoning: deepseek-r1:8b (5.2GB)
-                Code:      qwen3.5:4b     (3.4GB)
-              GPU 1 (RTX 3060, 12GB):
+                Code:      qwen2.5-coder:7b (4.4GB)
+              GPU 1 (RTX 5080, 16GB):
                 Reasoning: deepseek-r1:8b (5.2GB)
                 Code:      ministral-3:8b (6.0GB)
         """),
