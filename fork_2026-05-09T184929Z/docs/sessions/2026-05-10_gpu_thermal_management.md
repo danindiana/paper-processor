@@ -43,6 +43,7 @@ Investigate and implement temperature capping for the dual NVIDIA GPUs on this m
 
 Added to both `eco` and `perf` modes:
 - `nvidia-smi -i 1 -gtt 70` — RTX 3080 target temp 70°C
+- `nvidia-smi -pl 300 -i 1` (eco) / `pl 340` (perf) — RTX 3080 power cap
 - `nvidia-smi -pm 1 -i 0` + `nvidia-smi -pl 300 -i 0` (eco) / `pl 360` (perf) — RTX 5080 power cap
 
 ### 2. Live settings applied
@@ -50,6 +51,7 @@ Settings were applied immediately without a reboot:
 ```
 RTX 5080: power limit 360 W → 300 W
 RTX 3080: GPU Target Temperature → 70°C (revised from 80°C)
+RTX 3080: power limit 340 W → 300 W
 ```
 
 ### 3. Persistence mechanism
@@ -61,7 +63,7 @@ RTX 3080: GPU Target Temperature → 70°C (revised from 80°C)
 
 ```
 GPU 0  RTX 5080   68°C   198 W / 300 W limit   Target Temp: N/A (firmware-managed)
-GPU 1  RTX 3080   59°C   124 W / 340 W limit   Target Temp: 70°C
+GPU 1  RTX 3080   59°C   122 W / 300 W limit   Target Temp: 70°C
 ```
 
 ## Thermal Thresholds
@@ -101,6 +103,7 @@ GPU 1  RTX 3080   59°C      123–124 W / 340 W limit   fan: 67%
 | Slowdown Temp | T.Limit -2°C offset | 95°C |
 | Shutdown Temp | T.Limit -5°C offset | 98°C |
 | Margin to slowdown | N/A | 25°C |
+| Power cap (eco) | 300W (from 360W) | 300W (from 340W) |
 | Observed range (load) | 66–69°C / 200–213W | 59°C / 123–124W |
 | Fan (load) | 47–49% | 67% |
 | Persistence | gpu-eco-mode.service | gpu-eco-mode.service |
