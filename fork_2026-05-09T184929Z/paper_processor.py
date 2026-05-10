@@ -527,6 +527,11 @@ def select_model(page_count: int, user_override: Optional[str]) -> str:
     return get_gpu_model(tier)
 
 
+def _token_budget(page_count: int, *, base: int, slope: int, cap: int) -> int:
+    """Scale output token budget linearly with document size, clamped to cap."""
+    return min(cap, base + page_count * slope)
+
+
 def build_chunks(pages: List[str], window: int = 12, overlap: int = 2) -> List[str]:
     """Sliding-window chunking with overlap to preserve cross-page context."""
     if len(pages) <= window:
@@ -780,6 +785,11 @@ class PaperProcessor:
         model      = select_model(page_count, self.forced_model)
         code_model = self.forced_model or get_gpu_model("xl_code")
 
+        summary_tokens = _token_budget(page_count, base=1200, slope=30, cap=3000)
+        logic_tokens   = _token_budget(page_count, base=800,  slope=25, cap=2500)
+        cpp_tokens     = _token_budget(page_count, base=1200, slope=40, cap=3500)
+        extras_tokens  = _token_budget(page_count, base=1200, slope=35, cap=3500)
+
         chunks     = build_chunks(pages)
         strategy   = (
             f"single-pass ({page_count} pages)"
@@ -825,7 +835,7 @@ class PaperProcessor:
             print("     📝  Summary …")
             t0 = time.monotonic()
             try:
-                out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model, max_tokens=2048)
+                out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model, max_tokens=summary_tokens)
             except _ShutdownRequested:
                 _checkpoint()
                 print(f"     ⚡  Interrupted mid-section — {len(completed)} section(s) saved")
@@ -866,7 +876,7 @@ class PaperProcessor:
             t0 = time.monotonic()
             try:
                 print(f"     🔣  Symbolic logic  (model: {code_model}) …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), code_model, max_tokens=1536)
+                out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), code_model, max_tokens=logic_tokens)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
@@ -884,7 +894,7 @@ class PaperProcessor:
             t0 = time.monotonic()
             try:
                 print(f"     💻  C++ examples  (model: {code_model}) …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model, max_tokens=2048)
+                out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model, max_tokens=cpp_tokens)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
@@ -955,7 +965,7 @@ class PaperProcessor:
             t0 = time.monotonic()
             try:
                 print("     💡  Extras / critical analysis …")
-                out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model, max_tokens=2048)
+                out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model, max_tokens=extras_tokens)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
