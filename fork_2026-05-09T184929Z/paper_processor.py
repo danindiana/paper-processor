@@ -905,6 +905,20 @@ class PaperProcessor:
                 if _shutdown.is_set():
                     return
                 diagrams = parse_diagrams(raw)
+                if not diagrams and not _shutdown.is_set():
+                    print("     ↺   No DOT blocks found; retrying with reason model …")
+                    _retry_prompt = (
+                        "OUTPUT ONLY the 6 delimited Graphviz DOT blocks below. "
+                        "Do NOT write prose, summaries, or explanations. "
+                        "Start your first line with ===DIAGRAM_START:\n\n"
+                        + DIAGRAM_PROMPT
+                    )
+                    raw = self.backend.call(
+                        self._tag_prompt(_retry_prompt, capped[:60_000]),
+                        get_gpu_model("xl_quality"),
+                        ctx_tokens=32768,
+                    )
+                    diagrams = parse_diagrams(raw)
                 if not diagrams:
                     raw_out = paper_dir / "diagrams" / "_raw_llm_output.txt"
                     raw_out.write_text(raw, encoding="utf-8")
