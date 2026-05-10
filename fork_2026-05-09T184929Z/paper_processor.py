@@ -33,7 +33,7 @@ import textwrap
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -313,6 +313,8 @@ class Metadata:
     processed_at: str
     paper_hash: str
     sections_completed: List[str] = field(default_factory=list)
+    section_times: dict            = field(default_factory=dict)   # seconds per section
+    total_elapsed: float           = 0.0                            # wall time for whole paper
 
     def save(self, path: Path):
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
@@ -321,7 +323,9 @@ class Metadata:
     def load(cls, path: Path) -> Optional["Metadata"]:
         try:
             data = json.loads(path.read_text())
-            return cls(**data)
+            # Forward-compat: drop unknown keys so old JSON doesn't break new fields
+            known = {f.name for f in fields(cls)}
+            return cls(**{k: v for k, v in data.items() if k in known})
         except Exception:
             return None
 
@@ -730,6 +734,8 @@ class PaperProcessor:
         code_model: str,
         paper_hash: str,
         completed: List[str],
+        section_times: Optional[dict] = None,
+        total_elapsed: float = 0.0,
     ) -> None:
         Metadata(
             paper_name        = pdf_path.name,
@@ -741,6 +747,8 @@ class PaperProcessor:
             processed_at      = time.strftime("%Y-%m-%dT%H:%M:%S"),
             paper_hash        = paper_hash,
             sections_completed= completed,
+            section_times     = section_times or {},
+            total_elapsed     = round(total_elapsed, 1),
         ).save(meta_path)
 
     # ── Main entry ────────────────────────────────────────────────────────
@@ -780,36 +788,37 @@ class PaperProcessor:
         print(f"     strategy={strategy}")
 
         # Compute once — used for checkpoints throughout
-        paper_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
+        paper_hash    = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
         completed: List[str] = list(meta.sections_completed) if meta else []
+        section_times: dict  = dict(meta.section_times) if meta else {}
+        t_paper_start = time.monotonic()
 
         def _checkpoint():
             self._save_meta(meta_path, pdf_path, page_count, strategy,
-                            model, code_model, paper_hash, completed)
-
-        def _shutting_down() -> bool:
-            if _shutdown.is_set():
-                _checkpoint()
-                print(f"     ⚡  Stopped — {len(completed)} section(s) saved")
-                return True
-            return False
+                            model, code_model, paper_hash, completed,
+                            section_times, time.monotonic() - t_paper_start)
 
         # Condense multi-chunk papers to a manageable context string
+        t0 = time.monotonic()
         try:
             context = map_reduce_chunks(chunks, self.backend, model)
         except _ShutdownRequested:
             _checkpoint()
             print(f"     ⚡  Stopped during map-reduce — {len(completed)} section(s) saved")
             return
+        section_times["map_reduce"] = round(time.monotonic() - t0, 1)
+        print(f"     ↳ map-reduce done  ({section_times['map_reduce']:.0f}s)")
 
         # Cap to ~90k chars (~22k tokens) — safe for 32k-ctx models
         capped = context[:90_000]
 
         # ── 1. Summary ────────────────────────────────────────────────────
         if self._should_run("summary", completed):
-            if _shutting_down():
+            if _shutdown.is_set():
+                _checkpoint()
                 return
             print("     📝  Summary …")
+            t0 = time.monotonic()
             try:
                 out = self.backend.call(self._tag_prompt(PROMPTS["summary"], capped), model)
             except _ShutdownRequested:
@@ -819,8 +828,9 @@ class PaperProcessor:
             self._write_md(paper_dir / "01_summary.md", "Summary", out)
             if "summary" not in completed:
                 completed.append("summary")
+            section_times["summary"] = round(time.monotonic() - t0, 1)
             _checkpoint()
-            print("         ✓")
+            print(f"         ✓  ({section_times['summary']:.0f}s)")
 
         # ── Sections 2-5: fan out in parallel ─────────────────────────────────
         # All four consume `capped` independently — no inter-section dependencies.
@@ -837,24 +847,26 @@ class PaperProcessor:
         def _unpin():
             _thread_to_gpu.pop(threading.get_ident(), None)
 
-        def _complete(name: str):
+        def _complete(name: str, elapsed: float):
             with _sec_lock:
                 if name not in completed:
                     completed.append(name)
+                section_times[name] = round(elapsed, 1)
                 _checkpoint()
 
         def _run_logic():
             if not self._should_run("logic", completed) or _shutdown.is_set():
                 return
             _pin()
+            t0 = time.monotonic()
             try:
                 print("     🔣  Symbolic logic …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["logic"], capped), model)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "02_symbolic_logic.md", "Symbolic Logic Formulation", out)
-                _complete("logic")
-                print("         ✓ logic")
+                _complete("logic", time.monotonic() - t0)
+                print(f"         ✓ logic  ({section_times['logic']:.0f}s)")
             except _ShutdownRequested:
                 pass
             finally:
@@ -864,14 +876,15 @@ class PaperProcessor:
             if not self._should_run("cpp", completed) or _shutdown.is_set():
                 return
             _pin()
+            t0 = time.monotonic()
             try:
                 print(f"     💻  C++ examples  (model: {code_model}) …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["cpp"], capped), code_model)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "03_cpp_examples.md", "C++ Implementation Examples", out)
-                _complete("cpp")
-                print("         ✓ cpp")
+                _complete("cpp", time.monotonic() - t0)
+                print(f"         ✓ cpp  ({section_times['cpp']:.0f}s)")
             except _ShutdownRequested:
                 pass
             finally:
@@ -881,6 +894,7 @@ class PaperProcessor:
             if not self._should_run("diagrams", completed) or _shutdown.is_set():
                 return
             _pin()
+            t0 = time.monotonic()
             try:
                 print("     📊  Graphviz diagrams …")
                 raw = self.backend.call(
@@ -909,7 +923,7 @@ class PaperProcessor:
                         ok     = render_dot(dot_src, svg_path)
                         status = "✓" if ok else "✗ (dot saved, SVG render failed)"
                         print(f"       {idx}. {title:<45} {status}")
-                _complete("diagrams")
+                _complete("diagrams", time.monotonic() - t0)
             except _ShutdownRequested:
                 pass
             finally:
@@ -919,14 +933,15 @@ class PaperProcessor:
             if not self._should_run("extras", completed) or _shutdown.is_set():
                 return
             _pin()
+            t0 = time.monotonic()
             try:
                 print("     💡  Extras / critical analysis …")
                 out = self.backend.call(self._tag_prompt(PROMPTS["extras"], capped), model)
                 if _shutdown.is_set():
                     return
                 self._write_md(paper_dir / "04_extras.md", "Additional Insights", out)
-                _complete("extras")
-                print("         ✓ extras")
+                _complete("extras", time.monotonic() - t0)
+                print(f"         ✓ extras  ({section_times['extras']:.0f}s)")
             except _ShutdownRequested:
                 pass
             finally:
@@ -945,9 +960,14 @@ class PaperProcessor:
                 except Exception as _exc:
                     print(f"     ❌  Section error: {_exc}")
 
-        # ── Write / update metadata ────────────────────────────────────────
+        # ── Write / update metadata & print timing summary ────────────────
+        total = round(time.monotonic() - t_paper_start, 1)
         with _sec_lock:
             _checkpoint()
+        timing_str = "  ".join(
+            f"{k}={v:.0f}s" for k, v in section_times.items()
+        )
+        print(f"     ⏱   {timing_str}  total={total:.0f}s")
         print(f"     ✅  Output → {paper_dir}")
 
 

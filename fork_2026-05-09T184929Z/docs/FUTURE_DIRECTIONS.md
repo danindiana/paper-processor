@@ -157,11 +157,13 @@ Remaining diagram work:
 ## 5. Observability & Operations
 
 ### 5a. Per-paper timing log *(Low impact / Low effort)*
-**Status:** TODO
+**Status:** DONE (2026-05-10)
 
-No timing data is currently emitted. Recording wall-clock time per section and
-appending it to `metadata.json` would make it easy to identify slow papers and
-benchmark the effect of the parallel-sections improvement (item 1a).
+`section_times` (dict of section→seconds) and `total_elapsed` (float) added to
+`Metadata`. Each section closure records its own wall time via `time.monotonic()`.
+Map-reduce, summary, and each parallel section all emit elapsed seconds inline.
+A `⏱` summary line is printed before the final `✅` line. `Metadata.load()` updated
+to use field-name filtering so old JSON files without the new fields still load cleanly.
 
 ### 5b. Batch status dashboard *(Low impact / Medium effort)*
 **Status:** TODO
@@ -189,7 +191,7 @@ recover from transient Ollama contention without manual `--reprocess`.
 | ✅ Done  | 3a — pre-warm models at startup | Low |
 | ✅ Done  | 3b — keep-alive heartbeat | Low |
 | ✅ Done  | 1a — parallel sections | Medium |
-| **Next** | 5a — per-paper timing in metadata | Low |
+| ✅ Done  | 5a — per-paper timing in metadata | Low |
 | **Future** | 2b — tiered model selection | Low |
 | **Future** | 2b — tiered model selection | Low |
 | **Future** | 4 — batch reprocess diagrams | Ops task |
