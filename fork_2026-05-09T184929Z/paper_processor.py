@@ -653,7 +653,8 @@ class PaperProcessor:
         verbose: bool = False,
     ):
         self.papers_dir   = papers_dir
-        self.out_root     = papers_dir / "_processed"
+        # Isolation Fix: Store output locally within the fork directory
+        self.out_root     = Path(__file__).parent / "_processed"
         self.backend      = backend
         self.forced_model = forced_model
         self.reprocess    = reprocess  # section name or "all"
