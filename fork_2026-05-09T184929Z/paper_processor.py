@@ -503,10 +503,8 @@ def extract_pages(pdf_path: Path) -> List[str]:
 def select_model(page_count: int, user_override: Optional[str]) -> str:
     if user_override:
         return user_override
-    for threshold, tier_key in TIER_BY_PAGES:
-        if page_count <= threshold:
-            return MODEL_TIERS[tier_key]
-    return MODEL_TIERS["xl_quality"]
+    tier = "fast" if page_count <= 10 else "xl_quality"
+    return get_gpu_model(tier)
 
 
 def build_chunks(pages: List[str], window: int = 12, overlap: int = 2) -> List[str]:
@@ -728,7 +726,7 @@ class PaperProcessor:
         pages      = extract_pages(pdf_path)
         page_count = len(pages)
         model      = select_model(page_count, self.forced_model)
-        code_model = self.forced_model or CODE_MODEL
+        code_model = self.forced_model or get_gpu_model("xl_code")
 
         chunks     = build_chunks(pages)
         strategy   = (
@@ -922,31 +920,27 @@ def list_status(papers_dir: Path):
 
 
 def health_check_ollama():
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        r.raise_for_status()
-        models = [m["name"] for m in r.json().get("models", [])]
-        print(f"  🟢  Ollama reachable at {OLLAMA_URL}")
-        print(f"       {len(models)} models available")
-        return True
-    except Exception as exc:
-        print(f"  ❌  Cannot reach Ollama at {OLLAMA_URL}: {exc}")
-        return False
+    for gpu_id, url in BACKEND_URLS.items():
+        try:
+            r = requests.get(f"{url}/api/tags", timeout=5)
+            r.raise_for_status()
+            models = [m["name"] for m in r.json().get("models", [])]
+            print(f"  🟢  Ollama reachable at {url} (GPU {gpu_id})")
+        except Exception as exc:
+            print(f"  ❌  Cannot reach Ollama at {url}: {exc}")
+            return False
+    return True
 
 
 def check_required_models(models: List[str]) -> None:
-    """Exit with pull instructions if any model is absent from Ollama's local library.
-
-    Prevents auto-download hangs: missing models trigger a silent pull on first
-    generate request, which can exceed the 1200s timeout and cascade to all
-    subsequent papers (OLLAMA_NUM_PARALLEL=1 queues them behind the stuck request).
-    """
+    """Exit with pull instructions if any model is absent from Ollama's local library."""
+    url = BACKEND_URLS[0]
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        r = requests.get(f"{url}/api/tags", timeout=10)
         r.raise_for_status()
         available = {m["name"] for m in r.json().get("models", [])}
     except Exception:
-        return  # health_check_ollama already reported unreachable Ollama
+        return
     missing = [m for m in models if m not in available]
     if missing:
         sys.exit(
