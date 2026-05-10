@@ -83,11 +83,11 @@ class _ShutdownRequested(Exception):
 MODEL_TIERS = {
     "xl_quality":   "deepseek-r1:8b",               # 5.2 GB
     "xl_reason":    "deepseek-r1:8b",               # 5.2 GB
-    "xl_code":      "deepseek-coder:6.7b-instruct-q8_0", # 7.2 GB
-    "mid_code":     "deepseek-coder:6.7b-instruct-q8_0", # 7.2 GB
+    "xl_code":      "ministral-3:8b",               # 6.0 GB
+    "mid_code":     "ministral-3:8b",               # 6.0 GB
     "mid_reason":   "deepseek-r1:8b",               # 5.2 GB
     "single":       "deepseek-r1:8b",               # 5.2 GB
-    "single_code":  "deepseek-coder:6.7b-instruct-q8_0", # 7.2 GB
+    "single_code":  "ministral-3:8b",               # 6.0 GB
     "fast":         "qwen2.5:3b",                   # 1.9 GB
 }
 
@@ -990,7 +990,7 @@ def main():
             Model auto-selection (Constrained to ≤ 8.9 GB):
               ≤ 10 pages  →  qwen2.5:3b          (~1.9 GB)
               > 10 pages  →  deepseek-r1:8b      (~5.2 GB)
-              C++ section →  deepseek-coder:6.7b (~7.2 GB)
+              C++ section →  ministral-3:8b      (~6.0 GB)
         """),
     )
     ap.add_argument(
