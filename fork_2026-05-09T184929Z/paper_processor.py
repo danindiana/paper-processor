@@ -785,10 +785,10 @@ class PaperProcessor:
         model      = select_model(page_count, self.forced_model)
         code_model = self.forced_model or get_gpu_model("xl_code")
 
-        summary_tokens = _token_budget(page_count, base=1200, slope=30, cap=3000)
-        logic_tokens   = _token_budget(page_count, base=800,  slope=25, cap=2500)
-        cpp_tokens     = _token_budget(page_count, base=1200, slope=40, cap=3500)
-        extras_tokens  = _token_budget(page_count, base=1200, slope=35, cap=3500)
+        summary_tokens = _token_budget(page_count, base=1500, slope=45, cap=4000)
+        logic_tokens   = _token_budget(page_count, base=1000, slope=35, cap=3500)
+        cpp_tokens     = _token_budget(page_count, base=1500, slope=60, cap=5000)
+        extras_tokens  = _token_budget(page_count, base=1500, slope=50, cap=5000)
 
         chunks     = build_chunks(pages)
         strategy   = (
