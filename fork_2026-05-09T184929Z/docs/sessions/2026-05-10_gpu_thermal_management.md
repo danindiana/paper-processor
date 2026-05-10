@@ -92,6 +92,22 @@ GPU 1  RTX 3080   59°C      123–124 W / 340 W limit   fan: 67%
 
 ---
 
+## Boot Persistence Test (gpu-eco-mode.service restart)
+
+`sudo systemctl restart gpu-eco-mode.service` — ran 2026-05-10T01:19:48-05:00, exited status=0/SUCCESS.
+
+Post-restart verified state:
+```
+GPU 0  RTX 5080   70°C   235W / 300W limit   Target Temp: N/A
+GPU 1  RTX 3080   54°C    46W / 300W limit   Target Temp: 70°C
+```
+
+- All settings applied cleanly from the updated script.
+- 3080 dropped to 54°C / 46W with eco locked clocks active.
+- 5080 300W cap confirmed in both eco and perf modes.
+
+---
+
 ## Summary
 
 | Item | RTX 5080 (GPU 0) | RTX 3080 (GPU 1) |
