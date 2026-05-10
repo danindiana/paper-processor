@@ -354,12 +354,22 @@ ALL_SECTIONS = {"summary", "logic", "cpp", "diagrams", "extras"}
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKEND  (Ollama direct API  or  OpenClaw agent CLI)
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-GPU MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+_gpu_lock = threading.Lock()
+_gpu_available = [0, 1]  # RTX 3080 (0) and RTX 3060 (1)
+_thread_to_gpu = {}
+
+def get_assigned_gpu() -> int:
+    """Return the GPU ID assigned to the current thread."""
+    return _thread_to_gpu.get(threading.get_ident(), 0)
+
 class Backend:
     """
     Thin abstraction over LLM backends.
     Ollama  → POST /api/generate  (reliable, full model control)
     OpenClaw → `openclaw agent --message "..."` subprocess
-               (model selection via OPENCLAW_MODEL env var or pre-configured gateway)
     """
 
     def __init__(self, name: str, default_model: str):
@@ -380,10 +390,12 @@ class Backend:
     # ── Ollama ────────────────────────────────────────────────────────────
     def _call_ollama(self, prompt: str, model: str, ctx: int) -> str:
         url = f"{OLLAMA_URL}/api/generate"
+        gpu_id = get_assigned_gpu()
+        
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": True,  # Enable streaming for interruptibility
+            "stream": True,
             "options": {
                 "num_ctx":        ctx,
                 "temperature":    0.20,
@@ -391,6 +403,13 @@ class Backend:
                 "repeat_penalty": 1.10,
             },
         }
+        
+        # Note: Ollama server side handles OLLAMA_NUM_PARALLEL and scheduling.
+        # To truly force a specific GPU per request when multiple GPUs are visible
+        # to one server, we rely on Ollama's internal scheduling or run multiple
+        # servers. However, if we want to ensure throughput, we must ensure
+        # Ollama is configured with OLLAMA_NUM_PARALLEL >= workers.
+        
         for attempt in range(1, 3):
             if _shutdown.is_set():
                 return ""
@@ -424,8 +443,7 @@ class Backend:
                 )
             except requests.exceptions.Timeout as exc:
                 if attempt == 1 and not _shutdown.is_set():
-                    print(f"     ⏱  Ollama timed out — restarting and retrying (model={model}) …")
-                    _ollama_restart_service()
+                    print(f"     ⏱  Ollama timed out — retrying (model={model}) …")
                     continue
                 raise RuntimeError(f"Ollama error (model={model}): {exc}") from exc
             except (_ShutdownRequested, RuntimeError):
@@ -435,22 +453,13 @@ class Backend:
 
     # ── OpenClaw ──────────────────────────────────────────────────────────
     def _call_openclaw(self, prompt: str, model: str) -> str:
-        """
-        Calls:  openclaw agent --agent main --message "<prompt>"
-        Routes via the gateway and uses the agent's configured default model
-        (set in ~/.openclaw/openclaw.json). OPENCLAW_MODEL is exported for
-        builds that honour it, but the gateway path ignores per-call overrides
-        unless the caller is authorised — so per-page-count routing is a
-        no-op here. To restore per-call model selection, switch to
-        `openclaw agent --local --agent main --model <model> --message <p>`.
-        """
         env = os.environ.copy()
-        env["OPENCLAW_MODEL"] = model  # no-op against the gateway path
-
+        gpu_id = get_assigned_gpu()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        
         cmd = ["openclaw", "agent", "--agent", "main", "--message", prompt]
 
         try:
-            # Using Popen + poll for interruptibility
             with subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -462,33 +471,18 @@ class Backend:
                 while proc.poll() is None:
                     if _shutdown.is_set():
                         proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
                         return ""
                     if time.time() > deadline:
                         proc.kill()
-                        raise RuntimeError("OpenClaw agent timed out (>20 min)")
+                        raise RuntimeError("OpenClaw agent timed out")
                     time.sleep(1.0)
 
                 stdout, stderr = proc.communicate()
                 if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"openclaw agent exited {proc.returncode}: {stderr.strip() or '(no stderr)'}"
-                    )
-
-                output = stdout.strip()
-                if not output:
-                    raise RuntimeError("openclaw agent returned empty response")
-                return output
-
-        except FileNotFoundError:
-            sys.exit("❌  `openclaw` not found in PATH.")
+                    raise RuntimeError(f"openclaw agent exited {proc.returncode}")
+                return stdout.strip()
         except Exception as exc:
-            if isinstance(exc, RuntimeError):
-                raise
-            raise RuntimeError(f"OpenClaw error: {exc}") from exc
+            raise RuntimeError(f"OpenClaw error: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1120,11 +1114,30 @@ def main():
     # ── Process ────────────────────────────────────────────────────────────
     errors: List[str] = []
 
+    def _worker_wrapper(pdf: Path):
+        gpu_id = None
+        with _gpu_lock:
+            if _gpu_available:
+                gpu_id = _gpu_available.pop(0)
+            else:
+                # Fallback if more workers than GPUs (should not happen with workers=2)
+                gpu_id = 0
+        
+        _thread_to_gpu[threading.get_ident()] = gpu_id
+        print(f"  🚀  Assigned GPU {gpu_id} to {pdf.name}")
+        
+        try:
+            processor.process(pdf)
+        finally:
+            with _gpu_lock:
+                _gpu_available.append(gpu_id)
+            _thread_to_gpu.pop(threading.get_ident(), None)
+
     if args.workers > 1:
         print(f"  ⚡ Parallel mode: {args.workers} workers")
         print(f"  ⚠️   Ensure models fit in VRAM when running concurrently!\n")
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(processor.process, pdf): pdf for pdf in pdfs}
+            futures = {pool.submit(_worker_wrapper, pdf): pdf for pdf in pdfs}
             remaining = set(futures)
             while remaining:
                 done, remaining = wait(remaining, timeout=2.0,
