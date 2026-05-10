@@ -23,6 +23,9 @@ To maintain multi-model residency (keeping both a reasoning model and a code mod
 
 - **Double Throughput:** Process two papers simultaneously with `--workers 2`.
 - **Zero Eviction:** Reasoning and Code models are interleaved but never evicted because they co-exist in the assigned GPU's memory.
+- **Context Capping:** Preserves residency on VRAM-constrained hardware:
+  - **GPU 0 (3080):** Capped at **8,192** context window to fit dual models.
+  - **GPU 1 (5080):** Full **32,768** context window enabled.
 - **Parallel Chunking:** Long papers utilize `OLLAMA_NUM_PARALLEL` to process map-reduce chunks concurrently within a single GPU.
 - **Modern C++:** Generates C++20/23 implementations of paper algorithms.
 - **Neon Diagrams:** Automated Graphviz generation with a dark/neon aesthetic.

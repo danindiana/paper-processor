@@ -393,8 +393,17 @@ class Backend:
         ctx_tokens: int = 32768,
     ) -> str:
         m = model or self.default_model
+        gpu_id = get_assigned_gpu()
+        
+        # GPU-specific context window limits to preserve VRAM residency
+        # GPU 0 (3080, 10GB) capped at 8k to fit reasoning + code models
+        # GPU 1 (5080, 16GB) allowed full 32k
+        effective_ctx = ctx_tokens
+        if gpu_id == 0:
+            effective_ctx = min(ctx_tokens, 8192)
+            
         if self.name == "ollama":
-            return self._call_ollama(prompt, m, ctx_tokens)
+            return self._call_ollama(prompt, m, effective_ctx)
         return self._call_openclaw(prompt, m)
 
     # ── Ollama ────────────────────────────────────────────────────────────
