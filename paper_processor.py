@@ -836,11 +836,16 @@ class PaperProcessor:
                     f"          Tip: re-run with --reprocess diagrams after inspecting output."
                 )
             else:
+                # Purge stale slugs so reprocessing doesn't leave orphaned files
+                # from a prior run that used different diagram titles.
+                diag_dir = paper_dir / "diagrams"
+                for _stale in list(diag_dir.glob("*.dot")) + list(diag_dir.glob("*.svg")):
+                    _stale.unlink()
                 for idx, (title, dot_src) in enumerate(diagrams, 1):
                     dot_src  = ensure_neon_black(dot_src)
                     safe     = re.sub(r"[^\w\-]", "_", title)[:40].lower().strip("_")
-                    dot_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.dot"
-                    svg_path = paper_dir / "diagrams" / f"{idx:02d}_{safe}.svg"
+                    dot_path = diag_dir / f"{idx:02d}_{safe}.dot"
+                    svg_path = diag_dir / f"{idx:02d}_{safe}.svg"
                     dot_path.write_text(dot_src, encoding="utf-8")
                     ok     = render_dot(dot_src, svg_path)
                     status = "✓" if ok else "✗ (dot saved, SVG render failed)"
