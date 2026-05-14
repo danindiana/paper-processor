@@ -1,4 +1,4 @@
-# paper_processor — fork_2026-05-14T205304Z
+# paper_processor — fork_gptOSS_textonly_2026-05-14T205304Z
 
 ## What this fork is
 
