@@ -445,11 +445,27 @@ class Backend:
                             break
                 return "".join(full_response).strip()
 
-            except requests.exceptions.ConnectionError:
-                sys.exit(
-                    f"❌  Cannot reach Ollama at {OLLAMA_URL}\n"
+            except requests.exceptions.ConnectionError as exc:
+                if attempt == 1 and not _shutdown.is_set():
+                    print(f"     🔌  Ollama unreachable — waiting up to 60 s for it to come back …")
+                    deadline = time.time() + 60
+                    recovered = False
+                    while time.time() < deadline:
+                        time.sleep(3)
+                        try:
+                            requests.get(f"{OLLAMA_URL}/api/tags", timeout=3).raise_for_status()
+                            recovered = True
+                            break
+                        except Exception:
+                            print(".", end="", flush=True)
+                    if recovered:
+                        print(" recovered!")
+                        continue
+                    print(" timed out")
+                raise RuntimeError(
+                    f"❌  Cannot reach Ollama at {OLLAMA_URL} (model={model}): {exc}\n"
                     "    Is `ollama serve` running?"
-                )
+                ) from exc
             except requests.exceptions.Timeout as exc:
                 if attempt == 1 and not _shutdown.is_set():
                     print(f"     ⏱  Ollama timed out — restarting and retrying (model={model}) …")
