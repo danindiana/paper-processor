@@ -197,6 +197,7 @@ state of the workstation can be reconstructed from the repo alone.
 
 | Directory | Model change | Rationale |
 |-----------|-------------|-----------|
+| [`fork_2026-05-15T235801Z/`](fork_2026-05-15T235801Z/) | **Performance Optimization** | Optimized for RTX 5080 + 3080 mix. Added flags for `--ctx`, `--kv-cache`, and `--single-runner` to fix VRAM scheduling churn. |
 | [`fork_gptOSS_textonly_2026-05-14T205304Z/`](fork_gptOSS_textonly_2026-05-14T205304Z/) | `xl_quality`: `gemma4:31b-it-q4_K_M` → `gpt-oss:20b` | Pipeline is text-only (`fitz.get_text`; no image fields in either backend). Gemma 4's multimodal capacity is never exercised; `gpt-oss:20b` reclaims ~6 GB VRAM on the dual-GPU pool. |
 
 Each fork carries its own `docs/sessions/` log and a `README.md` describing the
