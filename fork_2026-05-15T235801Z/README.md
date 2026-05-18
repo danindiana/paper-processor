@@ -100,8 +100,8 @@ python paper_processor.py [papers_dir]
     --reprocess SECTION           summary|logic|cpp|diagrams|extras|all
     --workers N                   parallel papers (⚠ VRAM)
     --ctx TOKENS                  context length [default: 8192]
-    --no-flash                    disable Flash Attention
-    --kv-cache {q8_0,f16,f32}     KV cache quantization [default: q8_0]
+    --no-flash                    (ignored for Ollama — use OLLAMA_FLASH_ATTENTION env var)
+    --kv-cache {q8_0,f16,f32}     (ignored for Ollama — use OLLAMA_KV_CACHE_TYPE env var)
     --single-runner               keep_alive=0 after every request (minimizes VRAM churn)
     --list                        show status table, exit
     --override                    evict loaded Ollama models; restart service if stuck
