@@ -405,10 +405,9 @@ class Backend:
             "top_p":          0.90,
             "repeat_penalty": 1.10,
         }
-        if self.flash_attn:
-            options["flash_attention"] = True
-        if self.kv_cache_type:
-            options["kv_cache_type"] = self.kv_cache_type
+        # flash_attention and kv_cache_type are load-time runner settings that
+        # must be set via OLLAMA_FLASH_ATTENTION / OLLAMA_KV_CACHE_TYPE env vars
+        # in the systemd override; Ollama rejects them as per-request options.
 
         payload = {
             "model": model,
